@@ -39,7 +39,7 @@ func main() {
 	fmt.Printf("Connected to Redis: %s\n", pong)
 
 	// ArgoCD server URL
-	argocdServerURL := "http://localhost:8080" // Update this to your actual ArgoCD server URL
+	argocdServerURL := "http://localhost:8443" // Update this to your actual ArgoCD server URL
 
 	// Proxy handler
 	proxy := &httputil.ReverseProxy{
