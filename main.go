@@ -86,6 +86,7 @@ func handleApplicationsRequest(w http.ResponseWriter, redisClient *redis.Client)
 		value, err := redisClient.Get(key).Result()
 		if err != nil {
 			log.Fatalf("Failed to get value: %v", err)
+			continue
 		}
 
 		// Unmarshal the value into a map
@@ -96,7 +97,7 @@ func handleApplicationsRequest(w http.ResponseWriter, redisClient *redis.Client)
 		}
 
 		resp.Items = append(resp.Items, rawJson)
-		fmt.Printf("Value of %s: %s\n", key, rawJson)
+		// fmt.Printf("Value of %s: %s\n", key, rawJson)
 	}
 
 	// Serialize the key-value pairs as JSON
