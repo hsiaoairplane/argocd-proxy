@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -52,6 +53,39 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Verify the request with bearer token or the cookie argocd.token
+		// If the request is not verified, send it to the ArgoCD server proxy.ServeHTTP(w, r)
+		// Extract Bearer token from the Authorization header
+		authHeader := r.Header.Get("Authorization")
+		token := ""
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else {
+			cookie, err := r.Cookie("argocd.token")
+			if err == nil {
+				token = cookie.Value
+			}
+		}
+
+		// verify the jwt token and get the jwt payload "groups"
+		if token == "" {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+
+		// Decode the JWT payload
+		payload, err := decodeJWTPayload(token)
+		if err != nil {
+			// If decoding fails, proxy the request
+			proxy.ServeHTTP(w, r)
+			return
+		}
+
+		// Extract the "email" and "groups" from the payload
+		email, _ := payload["email"].(string)
+		groups, _ := payload["groups"].([]interface{})
+		fmt.Fprintf(w, "Email: %s, Groups: %v\n", email, groups)
+
 		// Capture GET requests to /api/v1/applications
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/applications") {
 			fmt.Printf("Request: %s %s\n", r.Method, r.URL.Path)
@@ -109,4 +143,27 @@ func main() {
 
 	log.Println("Proxy server running on :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
+}
+
+// decodeJWTPayload decodes the payload of a JWT token without validating it
+func decodeJWTPayload(token string) (map[string]interface{}, error) {
+	// Split the token into its parts (header, payload, signature)
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+
+	// Decode the payload (second part of the JWT)
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode payload: %v", err)
+	}
+
+	// Parse the JSON payload into a map
+	var payload map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal payload: %v", err)
+	}
+
+	return payload, nil
 }
