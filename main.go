@@ -62,17 +62,13 @@ func main() {
 			}
 			return ""
 		}()
-
-		// verify the jwt token and get the jwt payload "groups"
 		if token == "" {
 			proxy.ServeHTTP(w, r)
 			return
 		}
 
-		// Decode the JWT payload
 		payload, err := decodeJWTPayload(token)
 		if err != nil {
-			// If decoding fails, proxy the request
 			proxy.ServeHTTP(w, r)
 			return
 		}
