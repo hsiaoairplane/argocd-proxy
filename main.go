@@ -111,7 +111,6 @@ func main() {
 				}
 
 				resp.Items = append(resp.Items, rawJson)
-				// fmt.Printf("Value of %s: %s\n", key, rawJson)
 			}
 
 			if len(resp.Items) == 0 {
@@ -151,7 +150,6 @@ func decodeJWTPayload(token string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to decode payload: %v", err)
 	}
 
-	// Parse the JSON payload into a map
 	var payload map[string]interface{}
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal payload: %v", err)
