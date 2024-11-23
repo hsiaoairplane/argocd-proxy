@@ -53,19 +53,15 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Verify the request with bearer token or the cookie argocd.token
-		// If the request is not verified, send it to the ArgoCD server proxy.ServeHTTP(w, r)
-		// Extract Bearer token from the Authorization header
-		authHeader := r.Header.Get("Authorization")
-		token := ""
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			token = strings.TrimPrefix(authHeader, "Bearer ")
-		} else {
-			cookie, err := r.Cookie("argocd.token")
-			if err == nil {
-				token = cookie.Value
+		token := func() string {
+			if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+				return strings.TrimPrefix(authHeader, "Bearer ")
 			}
-		}
+			if cookie, err := r.Cookie("argocd.token"); err == nil {
+				return cookie.Value
+			}
+			return ""
+		}()
 
 		// verify the jwt token and get the jwt payload "groups"
 		if token == "" {
@@ -84,7 +80,7 @@ func main() {
 		// Extract the "email" and "groups" from the payload
 		email, _ := payload["email"].(string)
 		groups, _ := payload["groups"].([]interface{})
-		fmt.Fprintf(w, "Email: %s, Groups: %v\n", email, groups)
+		fmt.Printf("Email: %s, Groups: %v\n", email, groups)
 
 		// Capture GET requests to /api/v1/applications
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/applications") {
