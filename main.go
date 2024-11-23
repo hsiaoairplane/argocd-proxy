@@ -15,10 +15,6 @@ import (
 )
 
 func main() {
-	// write the proxy to capture the request matches to the HTTP GET and URL is the /api/v1/applications
-	// and the response is the JSON object with the key-value pairs of the Redis database
-	// The Redis database is running on the localhost:16379 and the password is empty
-
 	// Redis configuration
 	redisAddr := "localhost:16379" // Redis service DNS
 	redisPassword := ""            // Set the password if Redis authentication is enabled
