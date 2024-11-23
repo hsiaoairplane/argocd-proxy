@@ -55,7 +55,51 @@ func main() {
 		// Capture GET requests to /api/v1/applications
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/applications") {
 			fmt.Printf("Request: %s %s\n", r.Method, r.URL.Path)
-			handleApplicationsRequest(w, redisClient)
+			// Get a key-value pair
+			keys, err := redisClient.Keys("*|*|*|*|*").Result()
+			if err != nil {
+				log.Fatalf("Failed to get key: %v", err)
+				proxy.ServeHTTP(w, r)
+				return
+			}
+
+			var resp struct {
+				Items []interface{} `json:"items"`
+			}
+
+			resp.Items = make([]interface{}, 0)
+			for _, key := range keys {
+				var rawJson interface{}
+
+				value, err := redisClient.Get(key).Result()
+				if err != nil {
+					log.Fatalf("Failed to get value: %v", err)
+					continue
+				}
+
+				// Unmarshal the value into a map
+				err = json.Unmarshal([]byte(value), &rawJson)
+				if err != nil {
+					log.Printf("Failed to unmarshal value for key %s: %v", key, err)
+					continue
+				}
+
+				resp.Items = append(resp.Items, rawJson)
+				// fmt.Printf("Value of %s: %s\n", key, rawJson)
+			}
+
+			if len(resp.Items) == 0 {
+				proxy.ServeHTTP(w, r)
+				return
+			}
+
+			// Serialize the key-value pairs as JSON
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				log.Printf("Failed to write response: %v", err)
+				proxy.ServeHTTP(w, r)
+				return
+			}
 			return
 		}
 
@@ -65,45 +109,4 @@ func main() {
 
 	log.Println("Proxy server running on :8081")
 	log.Fatal(http.ListenAndServe(":8081", nil))
-}
-
-// handleApplicationsRequest fetches data from Redis and responds as JSON
-func handleApplicationsRequest(w http.ResponseWriter, redisClient *redis.Client) {
-	// Get a key-value pair
-	keys, err := redisClient.Keys("*|*|*|*|*").Result()
-	if err != nil {
-		log.Fatalf("Failed to get key: %v", err)
-	}
-
-	var resp struct {
-		Items []interface{} `json:"items"`
-	}
-
-	resp.Items = make([]interface{}, 0)
-	for _, key := range keys {
-		var rawJson interface{}
-
-		value, err := redisClient.Get(key).Result()
-		if err != nil {
-			log.Fatalf("Failed to get value: %v", err)
-			continue
-		}
-
-		// Unmarshal the value into a map
-		err = json.Unmarshal([]byte(value), &rawJson)
-		if err != nil {
-			log.Printf("Failed to unmarshal value for key %s: %v", key, err)
-			continue
-		}
-
-		resp.Items = append(resp.Items, rawJson)
-		// fmt.Printf("Value of %s: %s\n", key, rawJson)
-	}
-
-	// Serialize the key-value pairs as JSON
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		http.Error(w, fmt.Sprintf("Failed to write response: %v", err), http.StatusInternalServerError)
-		return
-	}
 }
