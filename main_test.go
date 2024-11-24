@@ -15,7 +15,7 @@ func TestParsePolicyCSV(t *testing.T) {
 			name: "Valid policy CSV with single team ALPHA READ ONLY",
 			policyCSV: `
 				g, admin@gmail.com, role:admin
-				g, admin@hotmail.com, role:admin
+				g, admin@hotmail.com, role:readonly
 				p, team-alpha-readonly, applications, get, alpha1-*, allow
 				p, team-alpha-readonly, applications, get, alpha2-*/*, allow
 				p, team-alpha-readonly, applications, get, alpha3-*, allow
@@ -48,7 +48,7 @@ func TestParsePolicyCSV(t *testing.T) {
 			name: "Valid policy CSV with multiple teams ALPHA READ ONLY and BETA READ ONLY",
 			policyCSV: `
 				g, admin@gmail.com, role:admin
-				g, admin@hotmail.com, role:admin
+				g, admin@hotmail.com, role:readonly
 				p, team-alpha-readonly, applications, get, alpha1-*, allow
 				p, team-alpha-readonly, applications, get, alpha2-*, allow
 				p, team-alpha-readonly, applications, get, alpha3-*/*, allow

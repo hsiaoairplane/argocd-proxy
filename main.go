@@ -193,7 +193,10 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 	groupToRoleMapping := make(map[string][]string)
 	roleToObjectPatternMapping := make(map[string][]string)
 
-	roleToObjectPatternMapping["role:admin"] = []string{"*"} // default role to object pattern mapping
+	// role:admin: unrestricted access to all objects
+	roleToObjectPatternMapping["role:admin"] = []string{"*"}
+	// role:readonly: read-only access to all objects
+	roleToObjectPatternMapping["role:readonly"] = []string{"*"}
 
 	lines := strings.Split(policyCSV, "\n")
 	for _, line := range lines {
