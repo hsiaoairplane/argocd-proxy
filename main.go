@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,9 +13,43 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v7"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func main() {
+	config := ctrl.GetConfigOrDie()
+	namespace := "argocd"
+	configMapName := "argocd-rbac-cm"
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes client: %v", err)
+	}
+
+	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
+	if err != nil {
+		log.Fatalf("Failed to fetch ConfigMap %s: %v", configMapName, err)
+	}
+
+	// Extract policy data from ConfigMap
+	policyCSV, ok := cm.Data["policy.csv"]
+	if !ok {
+		fmt.Printf("policy.csv not found in ConfigMap %s\n", configMapName)
+	} else {
+		fmt.Printf("Policy csv data: %s\n", policyCSV)
+
+		// Parse the policy.csv content and build the map
+		teamPermissions := parsePolicyCSV(policyCSV)
+
+		// Print the team permissions
+		fmt.Println("Team Permissions:")
+		for team, permissions := range teamPermissions {
+			fmt.Printf("Team: %s, Permissions: %v\n", team, permissions)
+		}
+	}
+
 	// Redis configuration
 	redisAddr := "localhost:16379" // Redis service DNS
 	redisPassword := ""            // Set the password if Redis authentication is enabled
@@ -152,4 +187,33 @@ func decodeJWTPayload(token string) (map[string]interface{}, error) {
 	}
 
 	return payload, nil
+}
+
+// parsePolicyCSV parses the policy.csv content and returns a map of teams to their application permissions
+func parsePolicyCSV(policyCSV string) map[string][]string {
+	teamPermissions := make(map[string][]string)
+
+	lines := strings.Split(policyCSV, "\n")
+	for _, line := range lines {
+		// Ignore empty lines and comments
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Split the line into fields
+		fields := strings.Split(line, ",")
+		for i := range fields {
+			fields[i] = strings.TrimSpace(fields[i]) // Trim spaces around each field
+		}
+
+		// Process policy entries
+		if fields[0] == "p" && len(fields) >= 5 {
+			team := fields[1]       // Extract the team
+			permission := fields[4] // Extract the application pattern
+			teamPermissions[team] = append(teamPermissions[team], permission)
+		}
+	}
+
+	return teamPermissions
 }
