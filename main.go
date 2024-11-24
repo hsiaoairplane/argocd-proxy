@@ -123,13 +123,11 @@ func main() {
 			fmt.Printf("Email: %s, Groups: %v\n", email, groups)
 
 			objectPatterns := make([]string, 0)
-			objectPattern, ok := userToObjectPatternMapping[email]
-			if ok {
+			if objectPattern, ok := userToObjectPatternMapping[email]; ok {
 				objectPatterns = append(objectPatterns, objectPattern...)
 			}
 			for _, group := range groups {
-				objectPattern, ok := groupToObjectPatternMapping[group]
-				if ok {
+				if objectPattern, ok := groupToObjectPatternMapping[group]; ok {
 					objectPatterns = append(objectPatterns, objectPattern...)
 				}
 			}
