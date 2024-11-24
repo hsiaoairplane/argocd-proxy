@@ -14,6 +14,8 @@ func TestParsePolicyCSV(t *testing.T) {
 		{
 			name: "Valid policy CSV with single team ALPHA READ ONLY",
 			policyCSV: `
+				g, admin@gmail.com, role:admin
+				g, admin@hotmail.com, role:admin
 				p, team-alpha-readonly, applications, get, alpha1-*, allow
 				p, team-alpha-readonly, applications, get, alpha2-*/*, allow
 				p, team-alpha-readonly, applications, get, alpha3-*, allow
@@ -22,6 +24,12 @@ func TestParsePolicyCSV(t *testing.T) {
 				g, foobar@gmail.com, team-alpha-readonly
 			`,
 			expected: map[string][]string{
+				"admin@gmail.com": {
+					"*",
+				},
+				"admin@hotmail.com": {
+					"*",
+				},
 				"ALPHA READ ONLY": {
 					"alpha1-*",
 					"alpha2-*",
@@ -39,6 +47,8 @@ func TestParsePolicyCSV(t *testing.T) {
 		{
 			name: "Valid policy CSV with multiple teams ALPHA READ ONLY and BETA READ ONLY",
 			policyCSV: `
+				g, admin@gmail.com, role:admin
+				g, admin@hotmail.com, role:admin
 				p, team-alpha-readonly, applications, get, alpha1-*, allow
 				p, team-alpha-readonly, applications, get, alpha2-*, allow
 				p, team-alpha-readonly, applications, get, alpha3-*/*, allow
@@ -48,6 +58,12 @@ func TestParsePolicyCSV(t *testing.T) {
 				g, barfoo@gmail.com, team-beta-readonly
 			`,
 			expected: map[string][]string{
+				"admin@gmail.com": {
+					"*",
+				},
+				"admin@hotmail.com": {
+					"*",
+				},
 				"ALPHA READ ONLY": {
 					"alpha1-*",
 					"alpha2-*",
@@ -66,7 +82,9 @@ func TestParsePolicyCSV(t *testing.T) {
 			policyCSV: `
 				g, GAMMA READ ONLY, team-gamma-readonly
 			`,
-			expected: map[string][]string{},
+			expected: map[string][]string{
+				"GAMMA READ ONLY": {},
+			},
 		},
 		{
 			name: "Valid policy CSV with single role but without group",

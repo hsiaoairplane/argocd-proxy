@@ -191,7 +191,9 @@ func decodeJWTPayload(token string) (map[string]interface{}, error) {
 
 func parsePolicyCSV(policyCSV string) map[string][]string {
 	groupToRoleMapping := make(map[string][]string)
-	roleToProjectPatternMapping := make(map[string][]string)
+	roleToObjectPatternMapping := make(map[string][]string)
+
+	roleToObjectPatternMapping["role:admin"] = []string{"*"} // default role to object pattern mapping
 
 	lines := strings.Split(policyCSV, "\n")
 	for _, line := range lines {
@@ -222,28 +224,32 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 		if fields[0] == "p" && len(fields) >= 5 {
 			role := fields[1]
 			resource := fields[2]
-			projectPattern := fields[4]
+			// action := fields[3]
+			objectPattern := fields[4]
+			// effect := field[5]
 
 			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec " {
-				projectPattern = strings.TrimSuffix(projectPattern, "/*")
+				objectPattern = strings.TrimSuffix(objectPattern, "/*")
 			}
 
-			if _, exists := roleToProjectPatternMapping[role]; !exists {
-				// Initialize the role in the roleToProjectPatternMapping map if it doesn't exist
-				roleToProjectPatternMapping[role] = []string{}
+			if _, exists := roleToObjectPatternMapping[role]; !exists {
+				// Initialize the role in the roleToObjectPatternMapping map if it doesn't exist
+				roleToObjectPatternMapping[role] = []string{}
 			}
-			roleToProjectPatternMapping[role] = append(roleToProjectPatternMapping[role], projectPattern)
+			roleToObjectPatternMapping[role] = append(roleToObjectPatternMapping[role], objectPattern)
 		}
 	}
 
-	// Return the group to project pattern mapping
-	groupToProjectPatternMapping := make(map[string][]string)
+	// Return the group to object pattern mapping
+	groupToObjectPatternMapping := make(map[string][]string)
 	for group, roles := range groupToRoleMapping {
+		groupToObjectPatternMapping[group] = []string{}
+
 		for _, role := range roles {
-			if projectPatterns, exists := roleToProjectPatternMapping[role]; exists {
-				groupToProjectPatternMapping[group] = append(groupToProjectPatternMapping[group], projectPatterns...)
+			if objectPatterns, exists := roleToObjectPatternMapping[role]; exists {
+				groupToObjectPatternMapping[group] = append(groupToObjectPatternMapping[group], objectPatterns...)
 			}
 		}
 	}
-	return groupToProjectPatternMapping
+	return groupToObjectPatternMapping
 }
