@@ -122,6 +122,7 @@ func main() {
 			groups, _ := payload["groups"].([]string)
 			fmt.Printf("Email: %s, Groups: %v\n", email, groups)
 
+			// Collect all unique object patterns for the user and groups
 			objectPatterns := make(map[string]struct{})
 			if objectPattern, ok := userToObjectPatternMapping[email]; ok {
 				for _, pattern := range objectPattern {
@@ -136,37 +137,59 @@ func main() {
 				}
 			}
 
-			var resp struct {
-				Items []interface{} `json:"items"`
+			// Prepare a list of keys to fetch from Redis
+			keyPatterns := make([]string, 0, len(objectPatterns))
+			for pattern := range objectPatterns {
+				keyPatterns = append(keyPatterns, fmt.Sprintf("%s|*", pattern))
 			}
-			resp.Items = make([]interface{}, 0)
-			for _, objectPattern := range objectPatterns {
-				// Get a key-value pair
-				keys, err := redisClient.Keys(fmt.Sprintf("%s|*", objectPattern)).Result()
+
+			// Batch process keys using Redis MGET
+			allKeys := make([]string, 0)
+			for _, keyPattern := range keyPatterns {
+				keys, err := redisClient.Keys(keyPattern).Result()
 				if err != nil {
-					log.Fatalf("Failed to get key: %v", err)
+					log.Printf("Failed to fetch keys for pattern %s: %v", keyPattern, err)
+					continue
+				}
+				allKeys = append(allKeys, keys...)
+			}
+
+			// Fetch all values for the keys in a single batch
+			keyValuePairs := make(map[string]string)
+			if len(allKeys) > 0 {
+				pipe := redisClient.Pipeline()
+				cmds := make([]*redis.StringCmd, len(allKeys))
+				for i, key := range allKeys {
+					cmds[i] = pipe.Get(key)
+				}
+				_, err := pipe.Exec()
+				if err != nil && err != redis.Nil {
+					log.Fatalf("Failed to fetch values for keys: %v", err)
 					proxy.ServeHTTP(w, r)
 					return
 				}
 
-				for _, key := range keys {
-					var rawJson interface{}
-
-					value, err := redisClient.Get(key).Result()
-					if err != nil {
-						log.Fatalf("Failed to get value: %v", err)
-						continue
+				for i, cmd := range cmds {
+					if cmd.Err() == nil {
+						keyValuePairs[allKeys[i]] = cmd.Val()
+					} else {
+						log.Printf("Failed to fetch value for key %s: %v", allKeys[i], cmd.Err())
 					}
-
-					// Unmarshal the value into a map
-					err = json.Unmarshal([]byte(value), &rawJson)
-					if err != nil {
-						log.Printf("Failed to unmarshal value for key %s: %v", key, err)
-						continue
-					}
-
-					resp.Items = append(resp.Items, rawJson)
 				}
+			}
+
+			// Unmarshal values and build the response
+			var resp struct {
+				Items []interface{} `json:"items"`
+			}
+			resp.Items = make([]interface{}, 0, len(keyValuePairs))
+			for key, value := range keyValuePairs {
+				var rawJson interface{}
+				if err := json.Unmarshal([]byte(value), &rawJson); err != nil {
+					log.Printf("Failed to unmarshal value for key %s: %v", key, err)
+					continue
+				}
+				resp.Items = append(resp.Items, rawJson)
 			}
 
 			if len(resp.Items) == 0 {
