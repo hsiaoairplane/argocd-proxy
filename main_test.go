@@ -1,6 +1,10 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 )
@@ -130,4 +134,124 @@ func TestParsePolicyCSV(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExtractToken(t *testing.T) {
+	tests := []struct {
+		name          string
+		setupRequest  func() *http.Request
+		expectedToken string
+	}{
+		{
+			name: "Valid Bearer Token in Authorization Header",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.Header.Set("Authorization", "Bearer valid_token")
+				return req
+			},
+			expectedToken: "valid_token",
+		},
+		{
+			name: "Token in Cookie",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.AddCookie(&http.Cookie{Name: "argocd.token", Value: "cookie_token"})
+				return req
+			},
+			expectedToken: "cookie_token",
+		},
+		{
+			name: "No Token in Header or Cookie",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				return req
+			},
+			expectedToken: "",
+		},
+		{
+			name: "Invalid Authorization Header",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.Header.Set("Authorization", "InvalidAuth valid_token")
+				return req
+			},
+			expectedToken: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := tt.setupRequest()
+			token := extractToken(req)
+
+			if token != tt.expectedToken {
+				t.Errorf("extractToken() = %q, want %q", token, tt.expectedToken)
+			}
+		})
+	}
+}
+
+func TestDecodeJWTPayload(t *testing.T) {
+	tests := []struct {
+		name           string
+		token          string
+		expected       map[string]interface{}
+		expectingError bool
+	}{
+		{
+			name:           "Valid JWT Token",
+			token:          createTestJWT(map[string]interface{}{"email": "test@example.com", "role": "admin"}),
+			expected:       map[string]interface{}{"email": "test@example.com", "role": "admin"},
+			expectingError: false,
+		},
+		{
+			name:           "Invalid JWT Token Format",
+			token:          "invalid.token",
+			expected:       nil,
+			expectingError: true,
+		},
+		{
+			name:           "Invalid Payload Encoding",
+			token:          "header." + base64.RawURLEncoding.EncodeToString([]byte("invalid payload")) + ".signature",
+			expected:       nil,
+			expectingError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload, err := decodeJWTPayload(tt.token)
+
+			if tt.expectingError && err == nil {
+				t.Errorf("Expected an error but got none")
+			}
+
+			if !tt.expectingError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+
+			if !tt.expectingError && !compareMaps(payload, tt.expected) {
+				t.Errorf("Payload mismatch. Expected: %v, Got: %v", tt.expected, payload)
+			}
+		})
+	}
+}
+
+func createTestJWT(payload map[string]interface{}) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payloadBytes, _ := json.Marshal(payload)
+	encodedPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
+	return header + "." + encodedPayload + ".signature"
+}
+
+func compareMaps(a, b map[string]interface{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, valueA := range a {
+		if valueB, exists := b[key]; !exists || valueA != valueB {
+			return false
+		}
+	}
+	return true
 }
