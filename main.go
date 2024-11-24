@@ -104,10 +104,10 @@ func main() {
 			return
 		}
 
-		// Extract the "email" and "groups" from the payload
+		// Extract the "email" and "groupToRoleMapping" from the payload
 		email, _ := payload["email"].(string)
-		groups, _ := payload["groups"].([]interface{})
-		fmt.Printf("Email: %s, Groups: %v\n", email, groups)
+		groupToRoleMapping, _ := payload["groupToRoleMapping"].([]interface{})
+		fmt.Printf("Email: %s, Groups: %v\n", email, groupToRoleMapping)
 
 		// Capture GET requests to /api/v1/applications
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/applications") {
@@ -189,9 +189,9 @@ func decodeJWTPayload(token string) (map[string]interface{}, error) {
 	return payload, nil
 }
 
-// parsePolicyCSV parses the policy.csv content and returns a map of teams to their application permissions
 func parsePolicyCSV(policyCSV string) map[string][]string {
-	teamPermissions := make(map[string][]string)
+	groupToRoleMapping := make(map[string][]string)
+	roleToProjectPatternMapping := make(map[string][]string)
 
 	lines := strings.Split(policyCSV, "\n")
 	for _, line := range lines {
@@ -207,13 +207,37 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 			fields[i] = strings.TrimSpace(fields[i]) // Trim spaces around each field
 		}
 
-		// Process policy entries
+		// Process "g" entries (group-role mappings)
+		if fields[0] == "g" && len(fields) >= 3 {
+			group := fields[1]
+			role := fields[2]
+			if _, exists := groupToRoleMapping[group]; !exists {
+				// Initialize the role in the groupToRoleMapping map if it doesn't exist
+				groupToRoleMapping[group] = []string{}
+			}
+			groupToRoleMapping[group] = append(groupToRoleMapping[group], role)
+		}
+
+		// Process "p" entries (role-resource mappings)
 		if fields[0] == "p" && len(fields) >= 5 {
-			team := fields[1]       // Extract the team
-			permission := fields[4] // Extract the application pattern
-			teamPermissions[team] = append(teamPermissions[team], permission)
+			role := fields[1]
+			projectPattern := fields[4]
+			if _, exists := roleToProjectPatternMapping[role]; !exists {
+				// Initialize the role in the roleToProjectPatternMapping map if it doesn't exist
+				roleToProjectPatternMapping[role] = []string{}
+			}
+			roleToProjectPatternMapping[role] = append(roleToProjectPatternMapping[role], projectPattern)
 		}
 	}
 
-	return teamPermissions
+	// Return the group to project pattern mapping
+	groupToProjectPatternMapping := make(map[string][]string)
+	for group, roles := range groupToRoleMapping {
+		for _, role := range roles {
+			if projectPatterns, exists := roleToProjectPatternMapping[role]; exists {
+				groupToProjectPatternMapping[group] = append(groupToProjectPatternMapping[group], projectPatterns...)
+			}
+		}
+	}
+	return groupToProjectPatternMapping
 }

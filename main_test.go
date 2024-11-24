@@ -12,50 +12,55 @@ func TestParsePolicyCSV(t *testing.T) {
 		expected  map[string][]string
 	}{
 		{
-			name: "Valid policy CSV with multiple teams",
+			name: "Valid policy CSV with single team ALPHA READ ONLY",
 			policyCSV: `
-				p, my-org:team-alpha, applications, get, alpha-*/*, allow
-				p, my-org:team-beta, applications, get, beta-*/*, allow
-				p, my-org:team-gamma, applications, get, gamma-*/*, allow
+				p, team-alpha-readonly, applications, get, alpha1-*, allow
+				p, team-alpha-readonly, applications, get, alpha2-*, allow
+				p, team-alpha-readonly, applications, get, alpha3-*, allow
+				g, ALPHA READ ONLY, team-alpha-readonly
 			`,
 			expected: map[string][]string{
-				"my-org:team-alpha": {"alpha-*/*"},
-				"my-org:team-beta":  {"beta-*/*"},
-				"my-org:team-gamma": {"gamma-*/*"},
+				"ALPHA READ ONLY": {
+					"alpha1-*",
+					"alpha2-*",
+					"alpha3-*",
+				},
 			},
 		},
 		{
-			name: "Policy CSV with comments and empty lines",
+			name: "Valid policy CSV with multiple teams ALPHA READ ONLY and BETA READ ONLY",
 			policyCSV: `
-				# This is a comment
-				p, my-org:team-alpha, applications, get, alpha-*/*, allow
-
-				# Another comment
-				p, my-org:team-beta, applications, get, beta-*/*, allow
-
+				p, team-alpha-readonly, applications, get, alpha1-*, allow
+				p, team-alpha-readonly, applications, get, alpha2-*, allow
+				p, team-alpha-readonly, applications, get, alpha3-*, allow
+				g, ALPHA READ ONLY, team-alpha-readonly
+				p, team-beta-readonly, applications, get, beta-*, allow
+				g, BETA READ ONLY, team-beta-readonly
 			`,
 			expected: map[string][]string{
-				"my-org:team-alpha": {"alpha-*/*"},
-				"my-org:team-beta":  {"beta-*/*"},
+				"ALPHA READ ONLY": {
+					"alpha1-*",
+					"alpha2-*",
+					"alpha3-*",
+				},
+				"BETA READ ONLY": {
+					"beta-*",
+				},
 			},
 		},
 		{
-			name: "Policy CSV with no valid policies",
+			name: "Valid policy CSV with single group but without role",
 			policyCSV: `
-				# This is a comment
-				g, my-org:team-alpha, role:read-only
+				g, GAMMA READ ONLY, team-gamma-readonly
 			`,
 			expected: map[string][]string{},
 		},
 		{
-			name: "Policy CSV with multiple policies for one team",
+			name: "Valid policy CSV with single role but without group",
 			policyCSV: `
-				p, my-org:team-alpha, applications, get, alpha-*/*, allow
-				p, my-org:team-alpha, applications, get, alpha-app1/*, allow
+				p, team-gamma-readonly, applications, get, gamma-*, allow
 			`,
-			expected: map[string][]string{
-				"my-org:team-alpha": {"alpha-*/*", "alpha-app1/*"},
-			},
+			expected: map[string][]string{},
 		},
 	}
 
