@@ -221,7 +221,13 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 		// Process "p" entries (role-resource mappings)
 		if fields[0] == "p" && len(fields) >= 5 {
 			role := fields[1]
+			resource := fields[2]
 			projectPattern := fields[4]
+
+			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec " {
+				projectPattern = strings.TrimSuffix(projectPattern, "/*")
+			}
+
 			if _, exists := roleToProjectPatternMapping[role]; !exists {
 				// Initialize the role in the roleToProjectPatternMapping map if it doesn't exist
 				roleToProjectPatternMapping[role] = []string{}
