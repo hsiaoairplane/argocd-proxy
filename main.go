@@ -34,6 +34,9 @@ func main() {
 	}
 
 	// Extract policy data from ConfigMap
+	var userToObjectPatternMapping map[string][]string = make(map[string][]string)
+	var groupToObjectPatternMapping map[string][]string = make(map[string][]string)
+
 	policyCSV, ok := cm.Data["policy.csv"]
 	if !ok {
 		fmt.Printf("policy.csv not found in ConfigMap %s\n", configMapName)
@@ -41,7 +44,7 @@ func main() {
 		fmt.Printf("Policy csv data: %s\n", policyCSV)
 
 		// Parse the policy.csv content and build the map
-		userToObjectPatternMapping, groupToObjectPatternMapping := parsePolicyCSV(policyCSV)
+		userToObjectPatternMapping, groupToObjectPatternMapping = parsePolicyCSV(policyCSV)
 
 		// Print the user permissions
 		fmt.Println("User Permissions:")
@@ -104,50 +107,64 @@ func main() {
 			return
 		}
 
-		payload, err := decodeJWTPayload(token)
-		if err != nil {
-			proxy.ServeHTTP(w, r)
-			return
-		}
-
-		// Extract the "email" and "groupToRoleMapping" from the payload
-		email, _ := payload["email"].(string)
-		groupToRoleMapping, _ := payload["groupToRoleMapping"].([]interface{})
-		fmt.Printf("Email: %s, Groups: %v\n", email, groupToRoleMapping)
-
 		// Capture GET requests to /api/v1/applications
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/applications") {
 			fmt.Printf("Request: %s %s\n", r.Method, r.URL.Path)
-			// Get a key-value pair
-			keys, err := redisClient.Keys("*|*|*|*|*").Result()
+
+			payload, err := decodeJWTPayload(token)
 			if err != nil {
-				log.Fatalf("Failed to get key: %v", err)
 				proxy.ServeHTTP(w, r)
 				return
+			}
+
+			// Extract the "email" and "groups" from the payload
+			email, _ := payload["email"].(string)
+			groups, _ := payload["groups"].([]string)
+			fmt.Printf("Email: %s, Groups: %v\n", email, groups)
+
+			objectPatterns := make([]string, 0)
+			objectPattern, ok := userToObjectPatternMapping[email]
+			if ok {
+				objectPatterns = append(objectPatterns, objectPattern...)
+			}
+			for _, group := range groups {
+				objectPattern, ok := groupToObjectPatternMapping[group]
+				if ok {
+					objectPatterns = append(objectPatterns, objectPattern...)
+				}
 			}
 
 			var resp struct {
 				Items []interface{} `json:"items"`
 			}
-
 			resp.Items = make([]interface{}, 0)
-			for _, key := range keys {
-				var rawJson interface{}
-
-				value, err := redisClient.Get(key).Result()
+			for _, objectPattern := range objectPatterns {
+				// Get a key-value pair
+				keys, err := redisClient.Keys(fmt.Sprintf("%s|*", objectPattern)).Result()
 				if err != nil {
-					log.Fatalf("Failed to get value: %v", err)
-					continue
+					log.Fatalf("Failed to get key: %v", err)
+					proxy.ServeHTTP(w, r)
+					return
 				}
 
-				// Unmarshal the value into a map
-				err = json.Unmarshal([]byte(value), &rawJson)
-				if err != nil {
-					log.Printf("Failed to unmarshal value for key %s: %v", key, err)
-					continue
-				}
+				for _, key := range keys {
+					var rawJson interface{}
 
-				resp.Items = append(resp.Items, rawJson)
+					value, err := redisClient.Get(key).Result()
+					if err != nil {
+						log.Fatalf("Failed to get value: %v", err)
+						continue
+					}
+
+					// Unmarshal the value into a map
+					err = json.Unmarshal([]byte(value), &rawJson)
+					if err != nil {
+						log.Printf("Failed to unmarshal value for key %s: %v", key, err)
+						continue
+					}
+
+					resp.Items = append(resp.Items, rawJson)
+				}
 			}
 
 			if len(resp.Items) == 0 {
