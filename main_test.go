@@ -18,9 +18,15 @@ func TestParsePolicyCSV(t *testing.T) {
 				p, team-alpha-readonly, applications, get, alpha2-*, allow
 				p, team-alpha-readonly, applications, get, alpha3-*, allow
 				g, ALPHA READ ONLY, team-alpha-readonly
+				g, foobar@gmail.com, team-alpha-readonly
 			`,
 			expected: map[string][]string{
 				"ALPHA READ ONLY": {
+					"alpha1-*",
+					"alpha2-*",
+					"alpha3-*",
+				},
+				"foobar@gmail.com": {
 					"alpha1-*",
 					"alpha2-*",
 					"alpha3-*",
@@ -36,6 +42,7 @@ func TestParsePolicyCSV(t *testing.T) {
 				g, ALPHA READ ONLY, team-alpha-readonly
 				p, team-beta-readonly, applications, get, beta-*, allow
 				g, BETA READ ONLY, team-beta-readonly
+				g, barfoo@gmail.com, team-beta-readonly
 			`,
 			expected: map[string][]string{
 				"ALPHA READ ONLY": {
@@ -44,6 +51,9 @@ func TestParsePolicyCSV(t *testing.T) {
 					"alpha3-*",
 				},
 				"BETA READ ONLY": {
+					"beta-*",
+				},
+				"barfoo@gmail.com": {
 					"beta-*",
 				},
 			},
