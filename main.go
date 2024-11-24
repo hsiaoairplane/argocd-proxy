@@ -122,13 +122,17 @@ func main() {
 			groups, _ := payload["groups"].([]string)
 			fmt.Printf("Email: %s, Groups: %v\n", email, groups)
 
-			objectPatterns := make([]string, 0)
+			objectPatterns := make(map[string]struct{})
 			if objectPattern, ok := userToObjectPatternMapping[email]; ok {
-				objectPatterns = append(objectPatterns, objectPattern...)
+				for _, pattern := range objectPattern {
+					objectPatterns[pattern] = struct{}{}
+				}
 			}
 			for _, group := range groups {
 				if objectPattern, ok := groupToObjectPatternMapping[group]; ok {
-					objectPatterns = append(objectPatterns, objectPattern...)
+					for _, pattern := range objectPattern {
+						objectPatterns[pattern] = struct{}{}
+					}
 				}
 			}
 

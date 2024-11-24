@@ -22,6 +22,7 @@ func TestParsePolicyCSV(t *testing.T) {
 				p, team-alpha-readonly, applications, get, alpha3-*, allow
 				p, team-alpha-readonly, applications, get, alpha4-*/*, allow
 				g, ALPHA READ ONLY, team-alpha-readonly
+				g, ALPHA READ ONLY_TW, team-alpha-readonly
 				g, foobar@gmail.com, team-alpha-readonly
 			`,
 			expectedUserToObjectPatternMapping: map[string][]string{
@@ -40,6 +41,12 @@ func TestParsePolicyCSV(t *testing.T) {
 			},
 			expectedGroupToObjectPatternMapping: map[string][]string{
 				"ALPHA READ ONLY": {
+					"alpha1-*",
+					"alpha2-*",
+					"alpha3-*",
+					"alpha4-*",
+				},
+				"ALPHA READ ONLY_TW": {
 					"alpha1-*",
 					"alpha2-*",
 					"alpha3-*",
