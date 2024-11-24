@@ -136,6 +136,81 @@ func TestParsePolicyCSV(t *testing.T) {
 	}
 }
 
+func TestResolveObjectPatterns(t *testing.T) {
+	tests := []struct {
+		name                        string
+		email                       string
+		groups                      []string
+		userToObjectPatternMapping  map[string][]string
+		groupToObjectPatternMapping map[string][]string
+		expectedPatterns            map[string]struct{}
+	}{
+		{
+			name:   "User with direct patterns",
+			email:  "user1@example.com",
+			groups: []string{},
+			userToObjectPatternMapping: map[string][]string{
+				"user1@example.com": {"pattern1", "pattern2"},
+			},
+			groupToObjectPatternMapping: map[string][]string{},
+			expectedPatterns: map[string]struct{}{
+				"pattern1": {},
+				"pattern2": {},
+			},
+		},
+		{
+			name:   "Group with patterns",
+			email:  "user2@example.com",
+			groups: []string{"group1"},
+			userToObjectPatternMapping: map[string][]string{
+				"user2@example.com": {},
+			},
+			groupToObjectPatternMapping: map[string][]string{
+				"group1": {"pattern3", "pattern4"},
+			},
+			expectedPatterns: map[string]struct{}{
+				"pattern3": {},
+				"pattern4": {},
+			},
+		},
+		{
+			name:   "User and groups with patterns",
+			email:  "user3@example.com",
+			groups: []string{"group1", "group2"},
+			userToObjectPatternMapping: map[string][]string{
+				"user3@example.com": {"pattern5"},
+			},
+			groupToObjectPatternMapping: map[string][]string{
+				"group1": {"pattern6"},
+				"group2": {"pattern7"},
+			},
+			expectedPatterns: map[string]struct{}{
+				"pattern5": {},
+				"pattern6": {},
+				"pattern7": {},
+			},
+		},
+		{
+			name:                        "No patterns for user or groups",
+			email:                       "user4@example.com",
+			groups:                      []string{"group3"},
+			userToObjectPatternMapping:  map[string][]string{},
+			groupToObjectPatternMapping: map[string][]string{},
+			expectedPatterns:            map[string]struct{}{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resolveObjectPatterns(tt.email, tt.groups, tt.userToObjectPatternMapping, tt.groupToObjectPatternMapping)
+
+			if !reflect.DeepEqual(result, tt.expectedPatterns) {
+				t.Errorf("resolveObjectPatterns() = %v, want %v", result, tt.expectedPatterns)
+			}
+		})
+	}
+}
+
 func TestExtractToken(t *testing.T) {
 	tests := []struct {
 		name          string
