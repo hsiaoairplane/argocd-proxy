@@ -41,12 +41,18 @@ func main() {
 		fmt.Printf("Policy csv data: %s\n", policyCSV)
 
 		// Parse the policy.csv content and build the map
-		teamPermissions := parsePolicyCSV(policyCSV)
+		userToObjectPatternMapping, groupToObjectPatternMapping := parsePolicyCSV(policyCSV)
 
-		// Print the team permissions
-		fmt.Println("Team Permissions:")
-		for team, permissions := range teamPermissions {
-			fmt.Printf("Team: %s, Permissions: %v\n", team, permissions)
+		// Print the user permissions
+		fmt.Println("User Permissions:")
+		for user, objectPattern := range userToObjectPatternMapping {
+			fmt.Printf("User: %s, Permissions: %v\n", user, objectPattern)
+		}
+
+		// Print the group permissions
+		fmt.Println("Group Permissions:")
+		for group, objectPattern := range groupToObjectPatternMapping {
+			fmt.Printf("Group: %s, Permissions: %v\n", group, objectPattern)
 		}
 	}
 
@@ -189,13 +195,15 @@ func decodeJWTPayload(token string) (map[string]interface{}, error) {
 	return payload, nil
 }
 
-func parsePolicyCSV(policyCSV string) map[string][]string {
+func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string) {
+	userToRoleMapping := make(map[string][]string)
 	groupToRoleMapping := make(map[string][]string)
-	roleToObjectPatternMapping := make(map[string][]string)
 
-	// role:admin: unrestricted access to all objects
+	roleToObjectPatternMapping := make(map[string][]string)
+	// default rules
+	// - role:admin: unrestricted access to all objects
+	// - role:readonly: read-only access to all objects
 	roleToObjectPatternMapping["role:admin"] = []string{"*"}
-	// role:readonly: read-only access to all objects
 	roleToObjectPatternMapping["role:readonly"] = []string{"*"}
 
 	lines := strings.Split(policyCSV, "\n")
@@ -214,13 +222,26 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 
 		// Process "g" entries (group-role mappings)
 		if fields[0] == "g" && len(fields) >= 3 {
-			group := fields[1]
+			userOrGroup := fields[1]
 			role := fields[2]
-			if _, exists := groupToRoleMapping[group]; !exists {
-				// Initialize the role in the groupToRoleMapping map if it doesn't exist
-				groupToRoleMapping[group] = []string{}
+
+			if strings.Contains(userOrGroup, "@") {
+				// Process user-role mappings
+				user := userOrGroup
+				if _, exists := userToRoleMapping[user]; !exists {
+					// Initialize the role in the groupToRoleMapping map if it doesn't exist
+					userToRoleMapping[user] = []string{}
+				}
+				userToRoleMapping[user] = append(userToRoleMapping[user], role)
+			} else {
+				// Process group-role mappings
+				group := userOrGroup
+				if _, exists := groupToRoleMapping[group]; !exists {
+					// Initialize the role in the groupToRoleMapping map if it doesn't exist
+					groupToRoleMapping[group] = []string{}
+				}
+				groupToRoleMapping[group] = append(groupToRoleMapping[group], role)
 			}
-			groupToRoleMapping[group] = append(groupToRoleMapping[group], role)
 		}
 
 		// Process "p" entries (role-resource mappings)
@@ -243,7 +264,19 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 		}
 	}
 
-	// Return the group to object pattern mapping
+	// Aggregate the user to object pattern mapping
+	userToObjectPatternMapping := make(map[string][]string)
+	for user, roles := range userToRoleMapping {
+		userToObjectPatternMapping[user] = []string{}
+
+		for _, role := range roles {
+			if objectPatterns, exists := roleToObjectPatternMapping[role]; exists {
+				userToObjectPatternMapping[user] = append(userToObjectPatternMapping[user], objectPatterns...)
+			}
+		}
+	}
+
+	// Aggregate the group to object pattern mapping
 	groupToObjectPatternMapping := make(map[string][]string)
 	for group, roles := range groupToRoleMapping {
 		groupToObjectPatternMapping[group] = []string{}
@@ -254,5 +287,5 @@ func parsePolicyCSV(policyCSV string) map[string][]string {
 			}
 		}
 	}
-	return groupToObjectPatternMapping
+	return userToObjectPatternMapping, groupToObjectPatternMapping
 }
