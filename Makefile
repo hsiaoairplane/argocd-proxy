@@ -16,3 +16,7 @@ test:
 .PHONY: build
 build:
 	go build -o argocd-proxy -race -v .
+
+.PHONY: clean
+clean:
+	go clean ./...
