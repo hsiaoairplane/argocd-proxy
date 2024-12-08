@@ -37,7 +37,14 @@ func main() {
 	})
 
 	log.Println("Proxy server running on :8081")
-	log.Fatal(http.ListenAndServe(":8081", nil))
+	srv := &http.Server{
+		Addr:         ":8081",
+		Handler:      nil,              // default mux
+		ReadTimeout:  0,                // Disable read timeout for long-running connections
+		WriteTimeout: 0,                // Disable write timeout for streaming responses
+		IdleTimeout:  15 * time.Second, // Only applies to idle connections
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
@@ -83,6 +90,15 @@ func createReverseProxy(target string) *httputil.ReverseProxy {
 			req.URL.Host = parsedURL.Host
 			req.Host = parsedURL.Host
 		},
+		FlushInterval: 100 * time.Millisecond, // Enable periodic flushing for streaming
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if r.Context().Err() == context.Canceled {
+				log.Printf("Client disconnected: %s", r.URL.Path)
+			} else {
+				log.Printf("Proxy error: %v (URL: %s)", err, r.URL.Path)
+			}
+			http.Error(w, "Error during proxying request", http.StatusBadGateway)
+		},
 	}
 }
 
@@ -95,13 +111,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 
 	payload, err := decodeJWTPayload(token)
 	if err != nil {
+		fmt.Printf("Failed to decode JWT payload: %v\n", err)
 		proxy.ServeHTTP(w, r)
 		return
 	}
 
 	email, _ := payload["email"].(string)
 	groups, _ := payload["groups"].([]string)
-
 	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
 
 	resp := fetchApplicationsFromRedis(redisClient, objectPatterns)
