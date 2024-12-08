@@ -5,7 +5,7 @@ ARG TARGETARCH
 ARG VERSION
 
 COPY . .
-RUN GOOS=linux GOARCH=$TARGETARCH go build -o argocd-proxy .
+RUN GOOS=linux GOARCH=$TARGETARCH go build -o /bin/argocd-proxy .
 
 FROM golang:1.23
 
