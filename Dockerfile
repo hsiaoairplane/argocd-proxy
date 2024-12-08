@@ -4,8 +4,8 @@ ARG BUILDPLATFORM
 ARG TARGETARCH
 ARG VERSION
 
-COPY . /src
-RUN cd /src && GOOS=linux GOARCH=$TARGETARCH go build -o argocd-proxy -race -v .
+COPY . .
+RUN GOOS=linux GOARCH=$TARGETARCH go build -o argocd-proxy .
 
 FROM golang:1.23
 
