@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,6 +20,14 @@ import (
 )
 
 func main() {
+	// Define flags for configuration
+	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
+	redisDB := flag.Int("redis-db", 1, "Redis database number")
+	proxyBackend := flag.String("proxy-backend", "http://localhost:8080", "Backend URL for reverse proxy")
+
+	// Parse command-line flags
+	flag.Parse()
+
 	config := ctrl.GetConfigOrDie()
 
 	clientset, err := kubernetes.NewForConfig(config)
@@ -28,9 +37,11 @@ func main() {
 
 	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, "argocd", "argocd-rbac-cm")
 
-	redisClient := initializeRedis("localhost:16379", "", 1)
+	// Initialize Redis client
+	redisClient := initializeRedis(*redisAddr, *redisDB)
 
-	proxy := createReverseProxy("http://localhost:8080")
+	// Create a reverse proxy
+	proxy := createReverseProxy(*proxyBackend)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		handleRequest(w, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
@@ -63,10 +74,9 @@ func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, con
 	return parsePolicyCSV(policyCSV)
 }
 
-func initializeRedis(addr, password string, db int) *redis.Client {
+func initializeRedis(addr string, db int) *redis.Client {
 	client := redis.NewClient(&redis.Options{
 		Addr:        addr,
-		Password:    password,
 		DB:          db,
 		DialTimeout: 5 * time.Second,
 	})
