@@ -30,7 +30,7 @@ func main() {
 
 	redisClient := initializeRedis("localhost:16379", "", 1)
 
-	proxy := createReverseProxy("http://localhost:8443")
+	proxy := createReverseProxy("http://localhost:8080")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		handleRequest(w, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
@@ -49,7 +49,7 @@ func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, con
 
 	policyCSV, ok := cm.Data["policy.csv"]
 	if !ok {
-		fmt.Printf("policy.csv not found in ConfigMap %s", configMapName)
+		fmt.Printf("policy.csv not found in ConfigMap %s\n", configMapName)
 		return nil, nil
 	}
 
