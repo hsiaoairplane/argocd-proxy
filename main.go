@@ -13,13 +13,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-redis/redis/v7"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/go-redis/redis/v7"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Define Prometheus Histogram for HTTP request duration (milliseconds)
+var requestDuration = prometheus.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Name:    "argocd_proxy_request_duration",
+		Help:    "Duration of HTTP requests handled by the argocd proxy in milliseconds.",
+		Buckets: prometheus.DefBuckets,
+	},
+	[]string{"statuscode"},
 )
 
 func main() {
+	// Register Prometheus metrics
+	prometheus.MustRegister(requestDuration)
+
 	// Define flags for configuration
 	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
 	redisDB := flag.Int("redis-db", 1, "Redis database number")
@@ -44,8 +60,24 @@ func main() {
 	proxy := createReverseProxy(*proxyBackend)
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now() // Start measuring time
+
 		handleRequest(w, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
+
+		// Record duration
+		duration := float64(time.Since(start).Milliseconds())
+		statusCode := http.StatusOK
+
+		// Get actual response status if available
+		if rw, ok := w.(*responseWriter); ok {
+			statusCode = rw.statusCode
+		}
+
+		requestDuration.WithLabelValues(fmt.Sprintf("%d", statusCode)).Observe(duration)
 	})
+
+	// Expose Prometheus metrics endpoint
+	http.Handle("/metrics", promhttp.Handler())
 
 	log.Println("Proxy server running on :8081")
 	srv := &http.Server{
@@ -56,6 +88,17 @@ func main() {
 		IdleTimeout:  15 * time.Second, // Only applies to idle connections
 	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// Custom response writer to capture status codes
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
