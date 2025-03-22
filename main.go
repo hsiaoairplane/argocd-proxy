@@ -6,10 +6,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -20,6 +20,7 @@ import (
 	"github.com/go-redis/redis/v7"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
 )
 
 // Define Prometheus Histogram for HTTP request duration (milliseconds)
@@ -31,6 +32,11 @@ var requestDuration = prometheus.NewHistogramVec(
 	},
 	[]string{"statuscode"},
 )
+
+func init() {
+	log.SetFormatter(&log.JSONFormatter{})
+	log.SetOutput(os.Stdout)
+}
 
 func main() {
 	// Register Prometheus metrics
@@ -104,13 +110,13 @@ func (rw *responseWriter) WriteHeader(code int) {
 func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
 	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
-		fmt.Printf("Failed to fetch ConfigMap %s: %v", configMapName, err)
+		log.Errorf("Failed to fetch ConfigMap %s: %v", configMapName, err)
 		return nil, nil
 	}
 
 	policyCSV, ok := cm.Data["policy.csv"]
 	if !ok {
-		fmt.Printf("policy.csv not found in ConfigMap %s\n", configMapName)
+		log.Errorf("policy.csv not found in ConfigMap %s\n", configMapName)
 		return nil, nil
 	}
 
@@ -127,7 +133,7 @@ func initializeRedis(addr string, db int) *redis.Client {
 	if _, err := client.Ping().Result(); err != nil {
 		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
-	fmt.Println("Connected to Redis successfully")
+	log.Infoln("Connected to Redis successfully")
 	return client
 }
 
@@ -164,7 +170,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 
 	payload, err := decodeJWTPayload(token)
 	if err != nil {
-		fmt.Printf("Failed to decode JWT payload: %v\n", err)
+		log.Errorf("Failed to decode JWT payload: %v\n", err)
 		proxy.ServeHTTP(w, r)
 		return
 	}
