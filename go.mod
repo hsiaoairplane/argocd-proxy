@@ -8,7 +8,7 @@ require (
 	github.com/go-redis/redis/v7 v7.4.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/sirupsen/logrus v1.9.3
-	k8s.io/apimachinery v0.34.0
+	k8s.io/apimachinery v0.34.1
 	k8s.io/client-go v0.34.0
 	sigs.k8s.io/controller-runtime v0.22.1
 )
