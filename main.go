@@ -185,6 +185,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 		return
 	}
 
+	queryParams := r.URL.Query()
+	cluster := queryParams.Get("cluster")
+	namespace := queryParams.Get("namespace")
+	resp.Items = filterApplicationsByClusterAndNamespace(resp.Items, cluster, namespace)
+
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("Failed to write response: %v", err)
@@ -278,6 +283,53 @@ func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[st
 		}
 	}
 	return resp
+}
+
+// filterApplicationsByClusterAndNamespace filters application items by destination cluster and/or namespace.
+// The cluster parameter matches against spec.destination.server or spec.destination.name.
+// The namespace parameter matches against spec.destination.namespace.
+// An empty string for either parameter means no filtering is applied for that field.
+// The order of items in the returned slice matches the order of items in the input slice.
+func filterApplicationsByClusterAndNamespace(items []interface{}, cluster, namespace string) []interface{} {
+	if cluster == "" && namespace == "" {
+		return items
+	}
+
+	filtered := make([]interface{}, 0)
+	for _, item := range items {
+		app, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		spec, ok := app["spec"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		destination, ok := spec["destination"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		if cluster != "" {
+			server, _ := destination["server"].(string)
+			name, _ := destination["name"].(string)
+			if server != cluster && name != cluster {
+				continue
+			}
+		}
+
+		if namespace != "" {
+			destNamespace, _ := destination["namespace"].(string)
+			if destNamespace != namespace {
+				continue
+			}
+		}
+
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string) {
