@@ -319,6 +319,98 @@ func createTestJWT(payload map[string]interface{}) string {
 	return header + "." + encodedPayload + ".signature"
 }
 
+func TestFilterApplicationsByClusterAndNamespace(t *testing.T) {
+	makeApp := func(server, name, namespace string) interface{} {
+		return map[string]interface{}{
+			"spec": map[string]interface{}{
+				"destination": map[string]interface{}{
+					"server":    server,
+					"name":      name,
+					"namespace": namespace,
+				},
+			},
+		}
+	}
+
+	appA := makeApp("https://cluster-a.example.com", "cluster-a", "ns-1")
+	appB := makeApp("https://cluster-b.example.com", "cluster-b", "ns-2")
+	appC := makeApp("https://cluster-a.example.com", "cluster-a", "ns-2")
+	appD := makeApp("", "cluster-b", "ns-1")
+
+	tests := []struct {
+		name      string
+		items     []interface{}
+		cluster   string
+		namespace string
+		expected  []interface{}
+	}{
+		{
+			name:      "No filter returns all items",
+			items:     []interface{}{appA, appB, appC},
+			cluster:   "",
+			namespace: "",
+			expected:  []interface{}{appA, appB, appC},
+		},
+		{
+			name:      "Filter by cluster server URL",
+			items:     []interface{}{appA, appB, appC},
+			cluster:   "https://cluster-a.example.com",
+			namespace: "",
+			expected:  []interface{}{appA, appC},
+		},
+		{
+			name:      "Filter by cluster name",
+			items:     []interface{}{appA, appB, appD},
+			cluster:   "cluster-b",
+			namespace: "",
+			expected:  []interface{}{appB, appD},
+		},
+		{
+			name:      "Filter by namespace",
+			items:     []interface{}{appA, appB, appC},
+			cluster:   "",
+			namespace: "ns-2",
+			expected:  []interface{}{appB, appC},
+		},
+		{
+			name:      "Filter by cluster and namespace",
+			items:     []interface{}{appA, appB, appC},
+			cluster:   "https://cluster-a.example.com",
+			namespace: "ns-2",
+			expected:  []interface{}{appC},
+		},
+		{
+			name:      "No match returns empty list",
+			items:     []interface{}{appA, appB, appC},
+			cluster:   "https://no-cluster.example.com",
+			namespace: "",
+			expected:  []interface{}{},
+		},
+		{
+			name:      "Empty items list",
+			items:     []interface{}{},
+			cluster:   "https://cluster-a.example.com",
+			namespace: "ns-1",
+			expected:  []interface{}{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := filterApplicationsByClusterAndNamespace(tt.items, tt.cluster, tt.namespace)
+			if len(result) != len(tt.expected) {
+				t.Errorf("filterApplicationsByClusterAndNamespace() returned %d items, want %d", len(result), len(tt.expected))
+				return
+			}
+			for i, item := range result {
+				if !reflect.DeepEqual(item, tt.expected[i]) {
+					t.Errorf("filterApplicationsByClusterAndNamespace()[%d] = %v, want %v", i, item, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
 func compareMaps(a, b map[string]interface{}) bool {
 	if len(a) != len(b) {
 		return false
