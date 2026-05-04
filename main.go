@@ -23,14 +23,22 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Define Prometheus Histogram for HTTP request duration (milliseconds)
+// Define Prometheus metrics for HTTP request duration (milliseconds) and total request count.
 var requestDuration = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{
-		Name:    "argocd_proxy_request_duration",
+		Name:    "argocd_proxy_request_duration_milliseconds",
 		Help:    "Duration of HTTP requests handled by the argocd proxy in milliseconds.",
-		Buckets: prometheus.DefBuckets,
+		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
 	},
-	[]string{"statuscode"},
+	[]string{"method", "path", "statuscode"},
+)
+
+var requestTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "argocd_proxy_requests_total",
+		Help: "Total number of HTTP requests handled by the argocd proxy.",
+	},
+	[]string{"method", "path", "statuscode"},
 )
 
 func init() {
@@ -40,7 +48,7 @@ func init() {
 
 func main() {
 	// Register Prometheus metrics
-	prometheus.MustRegister(requestDuration)
+	prometheus.MustRegister(requestDuration, requestTotal)
 
 	// Define flags for configuration
 	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
@@ -68,18 +76,16 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now() // Start measuring time
 
-		handleRequest(w, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
+		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		handleRequest(rw, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
 
-		// Record duration
+		// Record duration and total request count
 		duration := float64(time.Since(start).Milliseconds())
-		statusCode := http.StatusOK
+		path := normalizePath(r.URL.Path)
+		statusCodeStr := fmt.Sprintf("%d", rw.statusCode)
 
-		// Get actual response status if available
-		if rw, ok := w.(*responseWriter); ok {
-			statusCode = rw.statusCode
-		}
-
-		requestDuration.WithLabelValues(fmt.Sprintf("%d", statusCode)).Observe(duration)
+		requestTotal.WithLabelValues(r.Method, path, statusCodeStr).Inc()
+		requestDuration.WithLabelValues(r.Method, path, statusCodeStr).Observe(duration)
 	})
 
 	// Expose Prometheus metrics endpoint
@@ -105,6 +111,27 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// normalizePath replaces dynamic segments in known API paths to reduce metric cardinality.
+// The application name is replaced with {name}, while any sub-resource (first path segment
+// after the name) is preserved for granular observability.
+// Examples:
+//   - /api/v1/applications/my-app            → /api/v1/applications/{name}
+//   - /api/v1/applications/my-app/resource-tree → /api/v1/applications/{name}/resource-tree
+func normalizePath(path string) string {
+	const appsPrefix = "/api/v1/applications/"
+	if strings.HasPrefix(path, appsPrefix) {
+		rest := strings.TrimPrefix(path, appsPrefix)
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) == 1 || parts[1] == "" {
+			return "/api/v1/applications/{name}"
+		}
+		// Preserve only the first sub-resource segment to avoid high cardinality.
+		subResource := strings.SplitN(parts[1], "/", 2)[0]
+		return "/api/v1/applications/{name}/" + subResource
+	}
+	return path
 }
 
 func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
