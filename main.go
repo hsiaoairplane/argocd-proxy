@@ -81,11 +81,10 @@ func main() {
 
 		// Record duration and total request count
 		duration := float64(time.Since(start).Milliseconds())
-		path := normalizePath(r.URL.Path)
 		statusCodeStr := fmt.Sprintf("%d", rw.statusCode)
 
-		requestTotal.WithLabelValues(r.Method, path, statusCodeStr).Inc()
-		requestDuration.WithLabelValues(r.Method, path, statusCodeStr).Observe(duration)
+		requestTotal.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Inc()
+		requestDuration.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Observe(duration)
 	})
 
 	// Expose Prometheus metrics endpoint
@@ -111,27 +110,6 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
-}
-
-// normalizePath replaces dynamic segments in known API paths to reduce metric cardinality.
-// The application name is replaced with {name}, while any sub-resource (first path segment
-// after the name) is preserved for granular observability.
-// Examples:
-//   - /api/v1/applications/my-app            → /api/v1/applications/{name}
-//   - /api/v1/applications/my-app/resource-tree → /api/v1/applications/{name}/resource-tree
-func normalizePath(path string) string {
-	const appsPrefix = "/api/v1/applications/"
-	if strings.HasPrefix(path, appsPrefix) {
-		rest := strings.TrimPrefix(path, appsPrefix)
-		parts := strings.SplitN(rest, "/", 2)
-		if len(parts) == 1 || parts[1] == "" {
-			return "/api/v1/applications/{name}"
-		}
-		// Preserve only the first sub-resource segment to avoid high cardinality.
-		subResource := strings.SplitN(parts[1], "/", 2)[0]
-		return "/api/v1/applications/{name}/" + subResource
-	}
-	return path
 }
 
 func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
