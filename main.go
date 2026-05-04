@@ -23,14 +23,22 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Define Prometheus Histogram for HTTP request duration (milliseconds)
+// Define Prometheus metrics for HTTP request duration (milliseconds) and total request count.
 var requestDuration = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{
-		Name:    "argocd_proxy_request_duration",
+		Name:    "argocd_proxy_request_duration_milliseconds",
 		Help:    "Duration of HTTP requests handled by the argocd proxy in milliseconds.",
-		Buckets: prometheus.DefBuckets,
+		Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
 	},
-	[]string{"statuscode"},
+	[]string{"method", "path", "statuscode"},
+)
+
+var requestTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "argocd_proxy_requests_total",
+		Help: "Total number of HTTP requests handled by the argocd proxy.",
+	},
+	[]string{"method", "path", "statuscode"},
 )
 
 func init() {
@@ -40,7 +48,7 @@ func init() {
 
 func main() {
 	// Register Prometheus metrics
-	prometheus.MustRegister(requestDuration)
+	prometheus.MustRegister(requestDuration, requestTotal)
 
 	// Define flags for configuration
 	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
@@ -68,18 +76,15 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now() // Start measuring time
 
-		handleRequest(w, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
+		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		handleRequest(rw, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
 
-		// Record duration
+		// Record duration and total request count
 		duration := float64(time.Since(start).Milliseconds())
-		statusCode := http.StatusOK
+		statusCodeStr := fmt.Sprintf("%d", rw.statusCode)
 
-		// Get actual response status if available
-		if rw, ok := w.(*responseWriter); ok {
-			statusCode = rw.statusCode
-		}
-
-		requestDuration.WithLabelValues(fmt.Sprintf("%d", statusCode)).Observe(duration)
+		requestTotal.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Inc()
+		requestDuration.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Observe(duration)
 	})
 
 	// Expose Prometheus metrics endpoint
