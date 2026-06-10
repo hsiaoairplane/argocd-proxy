@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +47,27 @@ func init() {
 	log.SetOutput(os.Stdout)
 }
 
+// rbacPolicy holds the resolved RBAC mappings and allows concurrent reads while
+// the background reloader swaps in fresh mappings.
+type rbacPolicy struct {
+	mu                          sync.RWMutex
+	userToObjectPatternMapping  map[string][]string
+	groupToObjectPatternMapping map[string][]string
+}
+
+func (p *rbacPolicy) get() (map[string][]string, map[string][]string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.userToObjectPatternMapping, p.groupToObjectPatternMapping
+}
+
+func (p *rbacPolicy) set(userMapping, groupMapping map[string][]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.userToObjectPatternMapping = userMapping
+	p.groupToObjectPatternMapping = groupMapping
+}
+
 func main() {
 	// Register Prometheus metrics
 	prometheus.MustRegister(requestDuration, requestTotal)
@@ -54,6 +76,7 @@ func main() {
 	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
 	redisDB := flag.Int("redis-db", 1, "Redis database number")
 	proxyBackend := flag.String("proxy-backend", "http://localhost:8080", "Backend URL for reverse proxy")
+	rbacReloadInterval := flag.Duration("rbac-reload-interval", 5*time.Minute, "How often to reload the RBAC ConfigMap (0 disables periodic reload)")
 
 	// Parse command-line flags
 	flag.Parse()
@@ -65,7 +88,20 @@ func main() {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, "argocd", "argocd-rbac-cm")
+	// Load the initial RBAC policy. Failure is non-fatal: the proxy stays
+	// fail-open by forwarding requests to the backend, which enforces RBAC.
+	policy := &rbacPolicy{}
+	if userMapping, groupMapping, err := loadRBACPolicyFromConfigMap(clientset, "argocd", "argocd-rbac-cm"); err != nil {
+		log.Errorf("Failed to load initial RBAC policy: %v", err)
+	} else {
+		policy.set(userMapping, groupMapping)
+	}
+
+	// Periodically reload the RBAC policy so ConfigMap changes are picked up
+	// without restarting the proxy.
+	if *rbacReloadInterval > 0 {
+		go reloadRBACPolicy(context.Background(), clientset, "argocd", "argocd-rbac-cm", *rbacReloadInterval, policy)
+	}
 
 	// Initialize Redis client
 	redisClient := initializeRedis(*redisAddr, *redisDB)
@@ -77,7 +113,7 @@ func main() {
 		start := time.Now() // Start measuring time
 
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		handleRequest(rw, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
+		handleRequest(rw, r, proxy, redisClient, policy)
 
 		// Record duration and total request count
 		duration := float64(time.Since(start).Milliseconds())
@@ -112,20 +148,41 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
+// reloadRBACPolicy reloads the RBAC ConfigMap on a fixed interval until the
+// context is cancelled. The existing policy is retained if a reload fails.
+func reloadRBACPolicy(ctx context.Context, clientset *kubernetes.Clientset, namespace, configMapName string, interval time.Duration, policy *rbacPolicy) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			userMapping, groupMapping, err := loadRBACPolicyFromConfigMap(clientset, namespace, configMapName)
+			if err != nil {
+				log.Errorf("Failed to reload RBAC policy, keeping previous policy: %v", err)
+				continue
+			}
+			policy.set(userMapping, groupMapping)
+			log.Infoln("Reloaded RBAC policy")
+		}
+	}
+}
+
+func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string, error) {
 	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
-		log.Errorf("Failed to fetch ConfigMap %s: %v", configMapName, err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("failed to fetch ConfigMap %s/%s: %w", namespace, configMapName, err)
 	}
 
 	policyCSV, ok := cm.Data["policy.csv"]
 	if !ok {
-		log.Errorf("policy.csv not found in ConfigMap %s\n", configMapName)
-		return nil, nil
+		return nil, nil, fmt.Errorf("policy.csv not found in ConfigMap %s/%s", namespace, configMapName)
 	}
 
-	return parsePolicyCSV(policyCSV)
+	userMapping, groupMapping := parsePolicyCSV(policyCSV)
+	return userMapping, groupMapping, nil
 }
 
 func initializeRedis(addr string, db int) *redis.Client {
@@ -166,7 +223,7 @@ func createReverseProxy(target string) *httputil.ReverseProxy {
 	}
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
+func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, policy *rbacPolicy) {
 	token := extractToken(r)
 	if token == "" || (r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/api/v1/applications")) {
 		proxy.ServeHTTP(w, r)
@@ -182,6 +239,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 
 	email, _ := payload["email"].(string)
 	groups, _ := payload["groups"].([]string)
+	userToObjectPatternMapping, groupToObjectPatternMapping := policy.get()
 	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
 
 	resp := fetchApplicationsFromRedis(redisClient, objectPatterns)
