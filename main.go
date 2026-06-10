@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,6 +57,9 @@ func main() {
 	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
 	redisDB := flag.Int("redis-db", 1, "Redis database number")
 	proxyBackend := flag.String("proxy-backend", "http://localhost:8080", "Backend URL for reverse proxy")
+	listenAddr := flag.String("listen-addr", ":8081", "Address the proxy listens on")
+	namespace := flag.String("namespace", "argocd", "Namespace where the ArgoCD RBAC ConfigMap lives")
+	rbacConfigMap := flag.String("rbac-configmap", "argocd-rbac-cm", "Name of the ArgoCD RBAC ConfigMap")
 
 	// Parse command-line flags
 	flag.Parse()
@@ -65,7 +71,7 @@ func main() {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, "argocd", "argocd-rbac-cm")
+	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, *namespace, *rbacConfigMap)
 
 	// Initialize Redis client
 	redisClient := initializeRedis(*redisAddr, *redisDB)
@@ -73,7 +79,8 @@ func main() {
 	// Create a reverse proxy
 	proxy := createReverseProxy(*proxyBackend)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now() // Start measuring time
 
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -88,17 +95,51 @@ func main() {
 	})
 
 	// Expose Prometheus metrics endpoint
-	http.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", promhttp.Handler())
 
-	log.Println("Proxy server running on :8081")
+	// Liveness and readiness probes for Kubernetes.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if err := redisClient.Ping().Err(); err != nil {
+			http.Error(w, "redis unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
 	srv := &http.Server{
-		Addr:         ":8081",
-		Handler:      nil,              // default mux
-		ReadTimeout:  0,                // Disable read timeout for long-running connections
-		WriteTimeout: 0,                // Disable write timeout for streaming responses
-		IdleTimeout:  15 * time.Second, // Only applies to idle connections
+		Addr:    *listenAddr,
+		Handler: mux,
+		// ReadTimeout/WriteTimeout are left unset to support long-running
+		// streaming responses, but ReadHeaderTimeout bounds how long a client
+		// may take to send headers, mitigating slowloris-style attacks.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       15 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+
+	// Handle SIGINT/SIGTERM for graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Infof("Proxy server running on %s", *listenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Wait for a termination signal, then drain in-flight requests.
+	<-ctx.Done()
+	stop()
+	log.Infoln("Shutdown signal received, draining connections...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("Graceful shutdown failed: %v", err)
+	}
+	log.Infoln("Proxy server stopped")
 }
 
 // Custom response writer to capture status codes
@@ -197,8 +238,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Failed to write response: %v", err)
-		proxy.ServeHTTP(w, r)
+		// Headers and a partial body may already be written, so we cannot fall
+		// back to the proxy here; just log the failure.
+		log.Errorf("Failed to write response: %v", err)
 	}
 }
 
