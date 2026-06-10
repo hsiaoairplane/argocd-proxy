@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +26,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 )
+
+const listApplicationsPath = "/api/v1/applications"
+
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
 
 // Define Prometheus metrics for HTTP request duration (milliseconds) and total request count.
 var requestDuration = prometheus.NewHistogramVec(
@@ -46,6 +55,32 @@ func init() {
 	log.SetOutput(os.Stdout)
 }
 
+// applicationList mirrors the shape of the ArgoCD list applications response.
+type applicationList struct {
+	Items []interface{} `json:"items"`
+}
+
+// rbacPolicy holds the resolved RBAC mappings and allows concurrent reads while
+// the background reloader swaps in fresh mappings.
+type rbacPolicy struct {
+	mu                          sync.RWMutex
+	userToObjectPatternMapping  map[string][]string
+	groupToObjectPatternMapping map[string][]string
+}
+
+func (p *rbacPolicy) get() (map[string][]string, map[string][]string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.userToObjectPatternMapping, p.groupToObjectPatternMapping
+}
+
+func (p *rbacPolicy) set(userMapping, groupMapping map[string][]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.userToObjectPatternMapping = userMapping
+	p.groupToObjectPatternMapping = groupMapping
+}
+
 func main() {
 	// Register Prometheus metrics
 	prometheus.MustRegister(requestDuration, requestTotal)
@@ -54,6 +89,10 @@ func main() {
 	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
 	redisDB := flag.Int("redis-db", 1, "Redis database number")
 	proxyBackend := flag.String("proxy-backend", "http://localhost:8080", "Backend URL for reverse proxy")
+	listenAddr := flag.String("listen-addr", ":8081", "Address the proxy listens on")
+	namespace := flag.String("namespace", "argocd", "Namespace where the ArgoCD RBAC ConfigMap lives")
+	rbacConfigMap := flag.String("rbac-configmap", "argocd-rbac-cm", "Name of the ArgoCD RBAC ConfigMap")
+	rbacReloadInterval := flag.Duration("rbac-reload-interval", 5*time.Minute, "How often to reload the RBAC ConfigMap (0 disables periodic reload)")
 
 	// Parse command-line flags
 	flag.Parse()
@@ -65,7 +104,22 @@ func main() {
 		log.Fatalf("Failed to create Kubernetes client: %v", err)
 	}
 
-	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, "argocd", "argocd-rbac-cm")
+	// Load the initial RBAC policy. Failure is non-fatal: the proxy stays
+	// fail-open by forwarding requests to the backend, which enforces RBAC.
+	policy := &rbacPolicy{}
+	if userMapping, groupMapping, err := loadRBACPolicyFromConfigMap(clientset, *namespace, *rbacConfigMap); err != nil {
+		log.Errorf("Failed to load initial RBAC policy: %v", err)
+	} else {
+		policy.set(userMapping, groupMapping)
+	}
+
+	// Periodically reload the RBAC policy so ConfigMap changes are picked up
+	// without restarting the proxy.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if *rbacReloadInterval > 0 {
+		go reloadRBACPolicy(ctx, clientset, *namespace, *rbacConfigMap, *rbacReloadInterval, policy)
+	}
 
 	// Initialize Redis client
 	redisClient := initializeRedis(*redisAddr, *redisDB)
@@ -73,32 +127,66 @@ func main() {
 	// Create a reverse proxy
 	proxy := createReverseProxy(*proxyBackend)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now() // Start measuring time
 
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		handleRequest(rw, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
+		handleRequest(rw, r, proxy, redisClient, policy)
 
-		// Record duration and total request count
+		// Record duration and total request count. The path is normalized to a
+		// bounded set of route templates to avoid Prometheus label cardinality
+		// blowups from per-application paths.
 		duration := float64(time.Since(start).Milliseconds())
 		statusCodeStr := fmt.Sprintf("%d", rw.statusCode)
+		path := normalizePath(r.URL.Path)
 
-		requestTotal.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Inc()
-		requestDuration.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Observe(duration)
+		requestTotal.WithLabelValues(r.Method, path, statusCodeStr).Inc()
+		requestDuration.WithLabelValues(r.Method, path, statusCodeStr).Observe(duration)
 	})
 
 	// Expose Prometheus metrics endpoint
-	http.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", promhttp.Handler())
 
-	log.Println("Proxy server running on :8081")
+	// Liveness and readiness probes for Kubernetes.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if err := redisClient.Ping().Err(); err != nil {
+			http.Error(w, "redis unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
 	srv := &http.Server{
-		Addr:         ":8081",
-		Handler:      nil,              // default mux
-		ReadTimeout:  0,                // Disable read timeout for long-running connections
-		WriteTimeout: 0,                // Disable write timeout for streaming responses
-		IdleTimeout:  15 * time.Second, // Only applies to idle connections
+		Addr:    *listenAddr,
+		Handler: mux,
+		// ReadTimeout/WriteTimeout are left unset to support long-running
+		// streaming responses, but ReadHeaderTimeout bounds how long a client
+		// may take to send headers, mitigating slowloris-style attacks.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       15 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+
+	go func() {
+		log.Infof("Proxy server (version %s) running on %s", version, *listenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Wait for a termination signal, then drain in-flight requests.
+	<-ctx.Done()
+	stop()
+	log.Infoln("Shutdown signal received, draining connections...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("Graceful shutdown failed: %v", err)
+	}
+	log.Infoln("Proxy server stopped")
 }
 
 // Custom response writer to capture status codes
@@ -112,20 +200,41 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
+// reloadRBACPolicy reloads the RBAC ConfigMap on a fixed interval until the
+// context is cancelled. The existing policy is retained if a reload fails.
+func reloadRBACPolicy(ctx context.Context, clientset *kubernetes.Clientset, namespace, configMapName string, interval time.Duration, policy *rbacPolicy) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			userMapping, groupMapping, err := loadRBACPolicyFromConfigMap(clientset, namespace, configMapName)
+			if err != nil {
+				log.Errorf("Failed to reload RBAC policy, keeping previous policy: %v", err)
+				continue
+			}
+			policy.set(userMapping, groupMapping)
+			log.Infoln("Reloaded RBAC policy")
+		}
+	}
+}
+
+func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string, error) {
 	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
-		log.Errorf("Failed to fetch ConfigMap %s: %v", configMapName, err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("failed to fetch ConfigMap %s/%s: %w", namespace, configMapName, err)
 	}
 
 	policyCSV, ok := cm.Data["policy.csv"]
 	if !ok {
-		log.Errorf("policy.csv not found in ConfigMap %s\n", configMapName)
-		return nil, nil
+		return nil, nil, fmt.Errorf("policy.csv not found in ConfigMap %s/%s", namespace, configMapName)
 	}
 
-	return parsePolicyCSV(policyCSV)
+	userMapping, groupMapping := parsePolicyCSV(policyCSV)
+	return userMapping, groupMapping, nil
 }
 
 func initializeRedis(addr string, db int) *redis.Client {
@@ -157,32 +266,45 @@ func createReverseProxy(target string) *httputil.ReverseProxy {
 		FlushInterval: 100 * time.Millisecond, // Enable periodic flushing for streaming
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() == context.Canceled {
-				log.Printf("Client disconnected: %s", r.URL.Path)
+				log.Infof("Client disconnected: %s", r.URL.Path)
 			} else {
-				log.Printf("Proxy error: %v (URL: %s)", err, r.URL.Path)
+				log.Errorf("Proxy error: %v (URL: %s)", err, r.URL.Path)
 			}
 			http.Error(w, "Error during proxying request", http.StatusBadGateway)
 		},
 	}
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
+// shouldInterceptListRequest reports whether a request targets the list
+// applications endpoint that the proxy serves from Redis. Only the exact list
+// path is intercepted; single-application reads (e.g. /api/v1/applications/foo)
+// and applicationsets are forwarded to the backend unchanged.
+func shouldInterceptListRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.URL.Path == listApplicationsPath
+}
+
+func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, policy *rbacPolicy) {
 	token := extractToken(r)
-	if token == "" || (r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/api/v1/applications")) {
+	if token == "" || !shouldInterceptListRequest(r) {
 		proxy.ServeHTTP(w, r)
 		return
 	}
 
 	payload, err := decodeJWTPayload(token)
 	if err != nil {
-		log.Errorf("Failed to decode JWT payload: %v\n", err)
+		log.Errorf("Failed to decode JWT payload: %v", err)
 		proxy.ServeHTTP(w, r)
 		return
 	}
 
+	// TODO(#2): verify the JWT signature (HS256 with the ArgoCD server.secretkey)
+	// before trusting these claims. The claims are currently consumed without
+	// signature verification.
 	email, _ := payload["email"].(string)
-	groups, _ := payload["groups"].([]string)
-	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
+	groups := extractGroups(payload)
+
+	userMapping, groupMapping := policy.get()
+	objectPatterns := resolveObjectPatterns(email, groups, userMapping, groupMapping)
 
 	resp := fetchApplicationsFromRedis(redisClient, objectPatterns)
 	if len(resp.Items) == 0 {
@@ -197,8 +319,9 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Failed to write response: %v", err)
-		proxy.ServeHTTP(w, r)
+		// Headers and a partial body may already be written, so we cannot fall
+		// back to the proxy here; just log the failure.
+		log.Errorf("Failed to write response: %v", err)
 	}
 }
 
@@ -230,6 +353,23 @@ func decodeJWTPayload(token string) (map[string]interface{}, error) {
 	return payload, nil
 }
 
+// extractGroups reads the "groups" claim from a decoded JWT payload. JSON arrays
+// unmarshal into []interface{}, so each element is converted to a string;
+// non-string elements are skipped.
+func extractGroups(payload map[string]interface{}) []string {
+	raw, ok := payload["groups"].([]interface{})
+	if !ok {
+		return nil
+	}
+	groups := make([]string, 0, len(raw))
+	for _, g := range raw {
+		if s, ok := g.(string); ok {
+			groups = append(groups, s)
+		}
+	}
+	return groups
+}
+
 func resolveObjectPatterns(email string, groups []string, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) map[string]struct{} {
 	objectPatterns := make(map[string]struct{})
 
@@ -246,18 +386,34 @@ func resolveObjectPatterns(email string, groups []string, userToObjectPatternMap
 	return objectPatterns
 }
 
-func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[string]struct{}) struct {
-	Items []interface{} `json:"items"`
-} {
-	resp := struct {
-		Items []interface{} `json:"items"`
-	}{Items: []interface{}{}}
+// scanKeys returns all Redis keys matching the given glob pattern using SCAN,
+// which iterates the keyspace in bounded batches instead of blocking the server
+// like KEYS does.
+func scanKeys(redisClient *redis.Client, match string) ([]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		batch, next, err := redisClient.Scan(cursor, match, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return keys, nil
+}
+
+func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[string]struct{}) applicationList {
+	resp := applicationList{Items: []interface{}{}}
 
 	var allKeys []string
 	for pattern := range objectPatterns {
-		keys, err := redisClient.Keys(fmt.Sprintf("%s|*", pattern)).Result()
+		keys, err := scanKeys(redisClient, fmt.Sprintf("%s|*", pattern))
 		if err != nil {
-			log.Printf("Failed to fetch keys for pattern %s: %v", pattern, err)
+			log.Errorf("Failed to scan keys for pattern %s: %v", pattern, err)
 			continue
 		}
 		allKeys = append(allKeys, keys...)
@@ -271,7 +427,7 @@ func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[st
 		}
 		_, err := pipe.Exec()
 		if err != nil && err != redis.Nil {
-			log.Printf("Failed to fetch values for keys: %v", err)
+			log.Errorf("Failed to fetch values for keys: %v", err)
 		}
 
 		for i, cmd := range cmds {
@@ -280,10 +436,10 @@ func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[st
 				if err := json.Unmarshal([]byte(cmd.Val()), &rawJson); err == nil {
 					resp.Items = append(resp.Items, rawJson)
 				} else {
-					log.Printf("Failed to unmarshal value for key %s: %v", allKeys[i], err)
+					log.Errorf("Failed to unmarshal value for key %s: %v", allKeys[i], err)
 				}
 			} else {
-				log.Printf("Failed to fetch value for key %s: %v", allKeys[i], cmd.Err())
+				log.Errorf("Failed to fetch value for key %s: %v", allKeys[i], cmd.Err())
 			}
 		}
 	}
@@ -335,6 +491,19 @@ func filterApplicationsByClusterAndNamespace(items []interface{}, cluster, names
 		filtered = append(filtered, item)
 	}
 	return filtered
+}
+
+// normalizePath maps a request path to a bounded set of route templates so that
+// Prometheus labels do not explode with per-application paths.
+func normalizePath(path string) string {
+	switch path {
+	case listApplicationsPath, "/metrics", "/healthz", "/readyz":
+		return path
+	}
+	if strings.HasPrefix(path, listApplicationsPath+"/") {
+		return listApplicationsPath + "/:name"
+	}
+	return "other"
 }
 
 func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string) {
@@ -394,7 +563,7 @@ func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string)
 			objectPattern := fields[4]
 			// effect := field[5]
 
-			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec " {
+			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec" {
 				objectPattern = strings.TrimSuffix(objectPattern, "/*")
 			}
 

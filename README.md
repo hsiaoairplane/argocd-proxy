@@ -31,7 +31,7 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
 
 2. Build the proxy:
    ```bash
-   go build -o argocd-proxy *.go
+   go build -o argocd-proxy .
    ```
 
 3. Deploy to Kubernetes:
@@ -58,17 +58,39 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
          containers:
          - name: argocd-proxy
            image: <your-image>
-           command: ["argocd-proxy"]
+           args:
+           - --redis-addr=<redis-address>
+           - --redis-db=<redis-db-index>
+           - --proxy-backend=<backend-url>
+           ports:
+           - containerPort: 8081
+           livenessProbe:
+             httpGet:
+               path: /healthz
+               port: 8081
+           readinessProbe:
+             httpGet:
+               path: /readyz
+               port: 8081
    ```
 
 4. Run the proxy locally for testing:
    ```bash
-   ./argocd-proxy --redis-address=<redis-address> --redis-db=<redis-db-index> --proxy-backend=<path-to-the-backend>
+   ./argocd-proxy --redis-addr=<redis-address> --redis-db=<redis-db-index> --proxy-backend=<backend-url>
    ```
 
 ## Configuration
 
 - **Flags**:
-  - `--redis-address`: Redis server address.
-  - `--redis-db`: Redis DB index.
-  - `--proxy-backend`: Proxy backend address.
+  - `--redis-addr`: Redis server address (default `localhost:16379`).
+  - `--redis-db`: Redis DB index (default `1`).
+  - `--proxy-backend`: Backend URL for the reverse proxy (default `http://localhost:8080`).
+  - `--listen-addr`: Address the proxy listens on (default `:8081`).
+  - `--namespace`: Namespace where the ArgoCD RBAC ConfigMap lives (default `argocd`).
+  - `--rbac-configmap`: Name of the ArgoCD RBAC ConfigMap (default `argocd-rbac-cm`).
+  - `--rbac-reload-interval`: How often to reload the RBAC ConfigMap; `0` disables periodic reload (default `5m`).
+
+- **Endpoints**:
+  - `/metrics`: Prometheus metrics.
+  - `/healthz`: Liveness probe.
+  - `/readyz`: Readiness probe (checks Redis connectivity).

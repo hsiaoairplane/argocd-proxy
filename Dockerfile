@@ -1,14 +1,18 @@
 FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 
-ARG BUILDPLATFORM
 ARG TARGETARCH
 ARG VERSION
 
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN GOOS=linux GOARCH=$TARGETARCH go build -o /bin/argocd-proxy .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+    go build -ldflags="-s -w -X main.version=${VERSION}" -o /bin/argocd-proxy .
 
-FROM golang:1.26
+FROM gcr.io/distroless/static:nonroot
 
 COPY --from=build /bin/argocd-proxy /usr/local/bin/argocd-proxy
 
+USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/argocd-proxy"]

@@ -411,6 +411,112 @@ func TestFilterApplicationsByClusterAndNamespace(t *testing.T) {
 	}
 }
 
+func TestExtractGroups(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  map[string]interface{}
+		expected []string
+	}{
+		{
+			name:     "Groups present as JSON array",
+			payload:  map[string]interface{}{"groups": []interface{}{"group1", "group2"}},
+			expected: []string{"group1", "group2"},
+		},
+		{
+			name:     "Groups missing",
+			payload:  map[string]interface{}{"email": "user@example.com"},
+			expected: nil,
+		},
+		{
+			name:     "Groups with non-string elements are skipped",
+			payload:  map[string]interface{}{"groups": []interface{}{"group1", 42, "group2"}},
+			expected: []string{"group1", "group2"},
+		},
+		{
+			name:     "Empty groups array",
+			payload:  map[string]interface{}{"groups": []interface{}{}},
+			expected: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractGroups(tt.payload)
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("extractGroups() = %v, want %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExtractGroupsFromDecodedJWT(t *testing.T) {
+	// Guard against the regression where a JSON array claim was asserted as
+	// []string directly, which always fails and silently drops all groups.
+	token := createTestJWT(map[string]interface{}{
+		"email":  "user@example.com",
+		"groups": []string{"team-a", "team-b"},
+	})
+
+	payload, err := decodeJWTPayload(token)
+	if err != nil {
+		t.Fatalf("decodeJWTPayload() unexpected error: %v", err)
+	}
+
+	groups := extractGroups(payload)
+	expected := []string{"team-a", "team-b"}
+	if !reflect.DeepEqual(groups, expected) {
+		t.Errorf("extractGroups() = %v, want %v", groups, expected)
+	}
+}
+
+func TestShouldInterceptListRequest(t *testing.T) {
+	tests := []struct {
+		name     string
+		method   string
+		path     string
+		expected bool
+	}{
+		{"GET list endpoint is intercepted", http.MethodGet, "/api/v1/applications", true},
+		{"single application is not intercepted", http.MethodGet, "/api/v1/applications/myapp", false},
+		{"applicationsets is not intercepted", http.MethodGet, "/api/v1/applicationsets", false},
+		{"resource subpath is not intercepted", http.MethodGet, "/api/v1/applications/myapp/resource-tree", false},
+		{"non-GET list endpoint is not intercepted", http.MethodPost, "/api/v1/applications", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if got := shouldInterceptListRequest(req); got != tt.expected {
+				t.Errorf("shouldInterceptListRequest(%s %s) = %v, want %v", tt.method, tt.path, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizePath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"/api/v1/applications", "/api/v1/applications"},
+		{"/metrics", "/metrics"},
+		{"/healthz", "/healthz"},
+		{"/readyz", "/readyz"},
+		{"/api/v1/applications/myapp", "/api/v1/applications/:name"},
+		{"/api/v1/applications/myapp/resource-tree", "/api/v1/applications/:name"},
+		{"/api/v1/clusters", "other"},
+		{"/", "other"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := normalizePath(tt.path); got != tt.expected {
+				t.Errorf("normalizePath(%q) = %q, want %q", tt.path, got, tt.expected)
+			}
+		})
+	}
+}
+
 func compareMaps(a, b map[string]interface{}) bool {
 	if len(a) != len(b) {
 		return false
