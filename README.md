@@ -31,7 +31,7 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
 
 2. Build the proxy:
    ```bash
-   go build -o argocd-proxy *.go
+   go build -o argocd-proxy .
    ```
 
 3. Deploy to Kubernetes:
@@ -63,12 +63,12 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
 
 4. Run the proxy locally for testing:
    ```bash
-   ./argocd-proxy --redis-address=<redis-address> --redis-db=<redis-db-index> --proxy-backend=<path-to-the-backend>
+   ./argocd-proxy --redis-addr=<redis-address> --redis-db=<redis-db-index> --proxy-backend=<backend-url>
    ```
 
 ## Configuration
 
 - **Flags**:
-  - `--redis-address`: Redis server address.
-  - `--redis-db`: Redis DB index.
-  - `--proxy-backend`: Proxy backend address.
+  - `--redis-addr`: Redis server address (default `localhost:16379`).
+  - `--redis-db`: Redis DB index (default `1`).
+  - `--proxy-backend`: Backend URL for the reverse proxy (default `http://localhost:8080`).
