@@ -23,6 +23,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const listApplicationsPath = "/api/v1/applications"
+
 // Define Prometheus metrics for HTTP request duration (milliseconds) and total request count.
 var requestDuration = prometheus.NewHistogramVec(
 	prometheus.HistogramOpts{
@@ -166,9 +168,17 @@ func createReverseProxy(target string) *httputil.ReverseProxy {
 	}
 }
 
+// shouldInterceptListRequest reports whether a request targets the list
+// applications endpoint that the proxy serves from Redis. Only the exact list
+// path is intercepted; single-application reads (e.g. /api/v1/applications/foo)
+// and applicationsets are forwarded to the backend unchanged.
+func shouldInterceptListRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.URL.Path == listApplicationsPath
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
 	token := extractToken(r)
-	if token == "" || (r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/api/v1/applications")) {
+	if token == "" || !shouldInterceptListRequest(r) {
 		proxy.ServeHTTP(w, r)
 		return
 	}
@@ -181,7 +191,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 	}
 
 	email, _ := payload["email"].(string)
-	groups, _ := payload["groups"].([]string)
+	groups := extractGroups(payload)
 	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
 
 	resp := fetchApplicationsFromRedis(redisClient, objectPatterns)
@@ -200,6 +210,23 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 		log.Printf("Failed to write response: %v", err)
 		proxy.ServeHTTP(w, r)
 	}
+}
+
+// extractGroups reads the "groups" claim from a decoded JWT payload. JSON arrays
+// unmarshal into []interface{}, so each element is converted to a string;
+// non-string elements are skipped.
+func extractGroups(payload map[string]interface{}) []string {
+	raw, ok := payload["groups"].([]interface{})
+	if !ok {
+		return nil
+	}
+	groups := make([]string, 0, len(raw))
+	for _, g := range raw {
+		if s, ok := g.(string); ok {
+			groups = append(groups, s)
+		}
+	}
+	return groups
 }
 
 func extractToken(r *http.Request) string {
@@ -394,7 +421,7 @@ func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string)
 			objectPattern := fields[4]
 			// effect := field[5]
 
-			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec " {
+			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec" {
 				objectPattern = strings.TrimSuffix(objectPattern, "/*")
 			}
 
