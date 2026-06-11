@@ -315,6 +315,26 @@ func resolveObjectPatterns(email string, groups []string, userToObjectPatternMap
 	return objectPatterns
 }
 
+// scanKeys returns all Redis keys matching the given glob pattern using SCAN,
+// which iterates the keyspace in bounded batches instead of blocking the server
+// like KEYS does.
+func scanKeys(redisClient *redis.Client, match string) ([]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		batch, next, err := redisClient.Scan(cursor, match, 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return keys, nil
+}
+
 func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[string]struct{}) struct {
 	Items []interface{} `json:"items"`
 } {
@@ -324,9 +344,9 @@ func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[st
 
 	var allKeys []string
 	for pattern := range objectPatterns {
-		keys, err := redisClient.Keys(fmt.Sprintf("%s|*", pattern)).Result()
+		keys, err := scanKeys(redisClient, fmt.Sprintf("%s|*", pattern))
 		if err != nil {
-			log.Printf("Failed to fetch keys for pattern %s: %v", pattern, err)
+			log.Printf("Failed to scan keys for pattern %s: %v", pattern, err)
 			continue
 		}
 		allKeys = append(allKeys, keys...)
