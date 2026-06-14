@@ -18,10 +18,10 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/go-redis/redis/v7"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -57,12 +57,11 @@ func main() {
 	prometheus.MustRegister(requestDuration, requestTotal)
 
 	// Define flags for configuration
-	redisAddr := flag.String("redis-addr", "localhost:16379", "Redis server address")
-	redisDB := flag.Int("redis-db", 1, "Redis database number")
 	proxyBackend := flag.String("proxy-backend", "http://localhost:8080", "Backend URL for reverse proxy")
 	listenAddr := flag.String("listen-addr", ":8081", "Address the proxy listens on")
 	namespace := flag.String("namespace", "argocd", "Namespace where the ArgoCD RBAC ConfigMap lives")
 	rbacConfigMap := flag.String("rbac-configmap", "argocd-rbac-cm", "Name of the ArgoCD RBAC ConfigMap")
+	resyncPeriod := flag.Duration("resync-period", 30*time.Minute, "Application informer resync period")
 
 	// Parse command-line flags
 	flag.Parse()
@@ -76,23 +75,32 @@ func main() {
 
 	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, *namespace, *rbacConfigMap)
 
-	// Initialize Redis client
-	redisClient := initializeRedis(*redisAddr, *redisDB)
+	dynamicClient := dynamic.NewForConfigOrDie(config)
+	store := NewAppStore()
+	cacheStore := NewResponseCache()
+
+	// Handle SIGINT/SIGTERM for graceful shutdown and informer lifecycle.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := startApplicationInformer(ctx, dynamicClient, *namespace, *resyncPeriod, store); err != nil {
+		log.Fatalf("Failed to start application informer: %v", err)
+	}
 
 	// Create a reverse proxy
 	proxy := createReverseProxy(*proxyBackend)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now() // Start measuring time
-
+		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		handleRequest(rw, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
 
-		// Record duration and total request count
+		if served := tryServeList(rw, r, store, cacheStore, userToObjectPatternMapping, groupToObjectPatternMapping); !served {
+			proxy.ServeHTTP(rw, r)
+		}
+
 		duration := float64(time.Since(start).Milliseconds())
 		statusCodeStr := fmt.Sprintf("%d", rw.statusCode)
-
 		requestTotal.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Inc()
 		requestDuration.WithLabelValues(r.Method, r.URL.Path, statusCodeStr).Observe(duration)
 	})
@@ -105,10 +113,6 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if err := redisClient.Ping().Err(); err != nil {
-			http.Error(w, "redis unavailable", http.StatusServiceUnavailable)
-			return
-		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -121,10 +125,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       15 * time.Second,
 	}
-
-	// Handle SIGINT/SIGTERM for graceful shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		log.Infof("Proxy server running on %s", *listenAddr)
@@ -172,20 +172,6 @@ func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, con
 	return parsePolicyCSV(policyCSV)
 }
 
-func initializeRedis(addr string, db int) *redis.Client {
-	client := redis.NewClient(&redis.Options{
-		Addr:        addr,
-		DB:          db,
-		DialTimeout: 5 * time.Second,
-	})
-
-	if _, err := client.Ping().Result(); err != nil {
-		log.Fatalf("Failed to connect to Redis: %v", err)
-	}
-	log.Infoln("Connected to Redis successfully")
-	return client
-}
-
 func createReverseProxy(target string) *httputil.ReverseProxy {
 	parsedURL, err := url.Parse(target)
 	if err != nil {
@@ -211,50 +197,16 @@ func createReverseProxy(target string) *httputil.ReverseProxy {
 }
 
 // shouldInterceptListRequest reports whether a request targets the list
-// applications endpoint that the proxy serves from Redis. Only the exact list
-// path is intercepted; single-application reads (e.g. /api/v1/applications/foo)
-// and applicationsets are forwarded to the backend unchanged.
+// applications endpoint that the proxy serves from the in-memory store. Only
+// the exact list path is intercepted; single-application reads (e.g.
+// /api/v1/applications/foo) and applicationsets are forwarded to the backend
+// unchanged.
 func shouldInterceptListRequest(r *http.Request) bool {
 	return r.Method == http.MethodGet && r.URL.Path == listApplicationsPath
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
-	token := extractToken(r)
-	if token == "" || !shouldInterceptListRequest(r) {
-		proxy.ServeHTTP(w, r)
-		return
-	}
-
-	payload, err := decodeJWTPayload(token)
-	if err != nil {
-		log.Errorf("Failed to decode JWT payload: %v\n", err)
-		proxy.ServeHTTP(w, r)
-		return
-	}
-
-	email, _ := payload["email"].(string)
-	groups := extractGroups(payload)
-	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
-
-	items := fetchRawApplications(redisClient, objectPatterns)
-	if len(items) == 0 {
-		proxy.ServeHTTP(w, r)
-		return
-	}
-
-	queryParams := r.URL.Query()
-	cluster := queryParams.Get("cluster")
-	namespace := queryParams.Get("namespace")
-	if cluster != "" || namespace != "" {
-		items = filterRawByClusterAndNamespace(items, cluster, namespace)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	writeApplicationList(w, items)
-}
-
 // writeApplicationList streams the cached applications as a {"items":[...]}
-// envelope. Each element is the raw JSON the watcher already stored in Redis, so
+// envelope. Each element is the raw JSON the informer already stored, so
 // no per-application marshaling happens here; the bytes are concatenated
 // directly. This is the hot path for large, unfiltered list responses.
 func writeApplicationList(w http.ResponseWriter, items [][]byte) {
@@ -272,6 +224,42 @@ func writeApplicationList(w http.ResponseWriter, items [][]byte) {
 		// back to the proxy here; just log the failure.
 		log.Errorf("Failed to write response: %v", err)
 	}
+}
+
+// filterRawByClusterAndNamespace filters raw application JSON by destination
+// cluster and/or namespace. The cluster parameter matches against
+// spec.destination.server or spec.destination.name; the namespace parameter
+// matches against spec.destination.namespace. Each item is unmarshaled into a
+// minimal struct purely to read the destination, but the original raw bytes are
+// what gets retained, so no re-marshaling occurs. The order of the returned
+// items matches the input order.
+func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [][]byte {
+	filtered := make([][]byte, 0, len(items))
+	for _, raw := range items {
+		var app struct {
+			Spec struct {
+				Destination struct {
+					Server    string `json:"server"`
+					Name      string `json:"name"`
+					Namespace string `json:"namespace"`
+				} `json:"destination"`
+			} `json:"spec"`
+		}
+		if err := json.Unmarshal(raw, &app); err != nil {
+			continue
+		}
+		dest := app.Spec.Destination
+
+		if cluster != "" && dest.Server != cluster && dest.Name != cluster {
+			continue
+		}
+		if namespace != "" && dest.Namespace != namespace {
+			continue
+		}
+
+		filtered = append(filtered, raw)
+	}
+	return filtered
 }
 
 // extractGroups reads the "groups" claim from a decoded JWT payload. JSON arrays
@@ -333,102 +321,6 @@ func resolveObjectPatterns(email string, groups []string, userToObjectPatternMap
 	}
 
 	return objectPatterns
-}
-
-// scanKeys returns all Redis keys matching the given glob pattern using SCAN,
-// which iterates the keyspace in bounded batches instead of blocking the server
-// like KEYS does.
-func scanKeys(redisClient *redis.Client, match string) ([]string, error) {
-	var keys []string
-	var cursor uint64
-	for {
-		batch, next, err := redisClient.Scan(cursor, match, 100).Result()
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, batch...)
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-	return keys, nil
-}
-
-// fetchRawApplications returns the raw JSON bytes of every application whose key
-// matches one of the object patterns. Values are returned exactly as the watcher
-// stored them in Redis; they are not deserialized, so callers can stream them
-// straight into the response without re-marshaling.
-func fetchRawApplications(redisClient *redis.Client, objectPatterns map[string]struct{}) [][]byte {
-	var allKeys []string
-	for pattern := range objectPatterns {
-		keys, err := scanKeys(redisClient, fmt.Sprintf("%s|*", pattern))
-		if err != nil {
-			log.Printf("Failed to scan keys for pattern %s: %v", pattern, err)
-			continue
-		}
-		allKeys = append(allKeys, keys...)
-	}
-
-	if len(allKeys) == 0 {
-		return nil
-	}
-
-	pipe := redisClient.Pipeline()
-	cmds := make([]*redis.StringCmd, len(allKeys))
-	for i, key := range allKeys {
-		cmds[i] = pipe.Get(key)
-	}
-	if _, err := pipe.Exec(); err != nil && err != redis.Nil {
-		log.Printf("Failed to fetch values for keys: %v", err)
-	}
-
-	items := make([][]byte, 0, len(allKeys))
-	for i, cmd := range cmds {
-		val, err := cmd.Result()
-		if err != nil {
-			log.Printf("Failed to fetch value for key %s: %v", allKeys[i], err)
-			continue
-		}
-		items = append(items, []byte(val))
-	}
-	return items
-}
-
-// filterRawByClusterAndNamespace filters raw application JSON by destination
-// cluster and/or namespace. The cluster parameter matches against
-// spec.destination.server or spec.destination.name; the namespace parameter
-// matches against spec.destination.namespace. Each item is unmarshaled into a
-// minimal struct purely to read the destination, but the original raw bytes are
-// what gets retained, so no re-marshaling occurs. The order of the returned
-// items matches the input order.
-func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [][]byte {
-	filtered := make([][]byte, 0, len(items))
-	for _, raw := range items {
-		var app struct {
-			Spec struct {
-				Destination struct {
-					Server    string `json:"server"`
-					Name      string `json:"name"`
-					Namespace string `json:"namespace"`
-				} `json:"destination"`
-			} `json:"spec"`
-		}
-		if err := json.Unmarshal(raw, &app); err != nil {
-			continue
-		}
-		dest := app.Spec.Destination
-
-		if cluster != "" && dest.Server != cluster && dest.Name != cluster {
-			continue
-		}
-		if namespace != "" && dest.Namespace != namespace {
-			continue
-		}
-
-		filtered = append(filtered, raw)
-	}
-	return filtered
 }
 
 func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string) {

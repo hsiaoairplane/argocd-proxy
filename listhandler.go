@@ -2,6 +2,28 @@ package main
 
 import "net/http"
 
+// tryServeList intercepts the list endpoint for authenticated callers and serves
+// it from the store/cache. It returns false when the request is not an
+// interceptable list call, the token is missing/unparseable, or the scope is
+// empty — in all those cases the caller falls through to the reverse proxy.
+func tryServeList(w http.ResponseWriter, r *http.Request, store *AppStore, cache *ResponseCache, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) bool {
+	token := extractToken(r)
+	if token == "" || !shouldInterceptListRequest(r) {
+		return false
+	}
+	payload, err := decodeJWTPayload(token)
+	if err != nil {
+		return false
+	}
+	email, _ := payload["email"].(string)
+	groups := extractGroups(payload)
+	patterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
+	if len(patterns) == 0 {
+		return false
+	}
+	return serveApplicationList(w, r, store, cache, patterns)
+}
+
 // serveApplicationList writes the cached, precompressed application list for the
 // caller's scope. It returns false (writing nothing) when the scope resolves to
 // zero applications, so the caller can fall through to the backend proxy — this
