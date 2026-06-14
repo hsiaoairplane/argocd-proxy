@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -319,9 +320,9 @@ func createTestJWT(payload map[string]interface{}) string {
 	return header + "." + encodedPayload + ".signature"
 }
 
-func TestFilterApplicationsByClusterAndNamespace(t *testing.T) {
-	makeApp := func(server, name, namespace string) interface{} {
-		return map[string]interface{}{
+func TestFilterRawByClusterAndNamespace(t *testing.T) {
+	makeApp := func(server, name, namespace string) []byte {
+		b, _ := json.Marshal(map[string]interface{}{
 			"spec": map[string]interface{}{
 				"destination": map[string]interface{}{
 					"server":    server,
@@ -329,7 +330,8 @@ func TestFilterApplicationsByClusterAndNamespace(t *testing.T) {
 					"namespace": namespace,
 				},
 			},
-		}
+		})
+		return b
 	}
 
 	appA := makeApp("https://cluster-a.example.com", "cluster-a", "ns-1")
@@ -339,72 +341,117 @@ func TestFilterApplicationsByClusterAndNamespace(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		items     []interface{}
+		items     [][]byte
 		cluster   string
 		namespace string
-		expected  []interface{}
+		expected  [][]byte
 	}{
 		{
-			name:      "No filter returns all items",
-			items:     []interface{}{appA, appB, appC},
-			cluster:   "",
-			namespace: "",
-			expected:  []interface{}{appA, appB, appC},
-		},
-		{
 			name:      "Filter by cluster server URL",
-			items:     []interface{}{appA, appB, appC},
+			items:     [][]byte{appA, appB, appC},
 			cluster:   "https://cluster-a.example.com",
 			namespace: "",
-			expected:  []interface{}{appA, appC},
+			expected:  [][]byte{appA, appC},
 		},
 		{
 			name:      "Filter by cluster name",
-			items:     []interface{}{appA, appB, appD},
+			items:     [][]byte{appA, appB, appD},
 			cluster:   "cluster-b",
 			namespace: "",
-			expected:  []interface{}{appB, appD},
+			expected:  [][]byte{appB, appD},
 		},
 		{
 			name:      "Filter by namespace",
-			items:     []interface{}{appA, appB, appC},
+			items:     [][]byte{appA, appB, appC},
 			cluster:   "",
 			namespace: "ns-2",
-			expected:  []interface{}{appB, appC},
+			expected:  [][]byte{appB, appC},
 		},
 		{
 			name:      "Filter by cluster and namespace",
-			items:     []interface{}{appA, appB, appC},
+			items:     [][]byte{appA, appB, appC},
 			cluster:   "https://cluster-a.example.com",
 			namespace: "ns-2",
-			expected:  []interface{}{appC},
+			expected:  [][]byte{appC},
 		},
 		{
 			name:      "No match returns empty list",
-			items:     []interface{}{appA, appB, appC},
+			items:     [][]byte{appA, appB, appC},
 			cluster:   "https://no-cluster.example.com",
 			namespace: "",
-			expected:  []interface{}{},
+			expected:  [][]byte{},
 		},
 		{
 			name:      "Empty items list",
-			items:     []interface{}{},
+			items:     [][]byte{},
 			cluster:   "https://cluster-a.example.com",
 			namespace: "ns-1",
-			expected:  []interface{}{},
+			expected:  [][]byte{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := filterApplicationsByClusterAndNamespace(tt.items, tt.cluster, tt.namespace)
+			result := filterRawByClusterAndNamespace(tt.items, tt.cluster, tt.namespace)
 			if len(result) != len(tt.expected) {
-				t.Errorf("filterApplicationsByClusterAndNamespace() returned %d items, want %d", len(result), len(tt.expected))
+				t.Errorf("filterRawByClusterAndNamespace() returned %d items, want %d", len(result), len(tt.expected))
 				return
 			}
 			for i, item := range result {
-				if !reflect.DeepEqual(item, tt.expected[i]) {
-					t.Errorf("filterApplicationsByClusterAndNamespace()[%d] = %v, want %v", i, item, tt.expected[i])
+				if !bytes.Equal(item, tt.expected[i]) {
+					t.Errorf("filterRawByClusterAndNamespace()[%d] = %s, want %s", i, item, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestWriteApplicationList(t *testing.T) {
+	tests := []struct {
+		name     string
+		items    [][]byte
+		expected string
+	}{
+		{
+			name:     "Empty list",
+			items:    [][]byte{},
+			expected: `{"items":[]}`,
+		},
+		{
+			name:     "Single item",
+			items:    [][]byte{[]byte(`{"metadata":{"name":"a"}}`)},
+			expected: `{"items":[{"metadata":{"name":"a"}}]}`,
+		},
+		{
+			name:     "Multiple items are comma-joined",
+			items:    [][]byte{[]byte(`{"metadata":{"name":"a"}}`), []byte(`{"metadata":{"name":"b"}}`)},
+			expected: `{"items":[{"metadata":{"name":"a"}},{"metadata":{"name":"b"}}]}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeApplicationList(rec, tt.items)
+
+			if got := rec.Body.String(); got != tt.expected {
+				t.Errorf("writeApplicationList() = %s, want %s", got, tt.expected)
+			}
+
+			// The envelope must be valid JSON and preserve every item verbatim
+			// (no re-marshaling), which is the whole point of the optimization.
+			var decoded struct {
+				Items []json.RawMessage `json:"items"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+				t.Fatalf("writeApplicationList() produced invalid JSON: %v", err)
+			}
+			if len(decoded.Items) != len(tt.items) {
+				t.Fatalf("decoded %d items, want %d", len(decoded.Items), len(tt.items))
+			}
+			for i, raw := range decoded.Items {
+				if !bytes.Equal(raw, tt.items[i]) {
+					t.Errorf("item[%d] = %s, want %s (bytes must be preserved)", i, raw, tt.items[i])
 				}
 			}
 		})

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -235,8 +236,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 	groups := extractGroups(payload)
 	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
 
-	resp := fetchApplicationsFromRedis(redisClient, objectPatterns)
-	if len(resp.Items) == 0 {
+	items := fetchRawApplications(redisClient, objectPatterns)
+	if len(items) == 0 {
 		proxy.ServeHTTP(w, r)
 		return
 	}
@@ -244,10 +245,29 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 	queryParams := r.URL.Query()
 	cluster := queryParams.Get("cluster")
 	namespace := queryParams.Get("namespace")
-	resp.Items = filterApplicationsByClusterAndNamespace(resp.Items, cluster, namespace)
+	if cluster != "" || namespace != "" {
+		items = filterRawByClusterAndNamespace(items, cluster, namespace)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
+	writeApplicationList(w, items)
+}
+
+// writeApplicationList streams the cached applications as a {"items":[...]}
+// envelope. Each element is the raw JSON the watcher already stored in Redis, so
+// no per-application marshaling happens here; the bytes are concatenated
+// directly. This is the hot path for large, unfiltered list responses.
+func writeApplicationList(w http.ResponseWriter, items [][]byte) {
+	bw := bufio.NewWriter(w)
+	bw.WriteString(`{"items":[`)
+	for i, raw := range items {
+		if i > 0 {
+			bw.WriteByte(',')
+		}
+		bw.Write(raw)
+	}
+	bw.WriteString("]}")
+	if err := bw.Flush(); err != nil {
 		// Headers and a partial body may already be written, so we cannot fall
 		// back to the proxy here; just log the failure.
 		log.Errorf("Failed to write response: %v", err)
@@ -335,13 +355,11 @@ func scanKeys(redisClient *redis.Client, match string) ([]string, error) {
 	return keys, nil
 }
 
-func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[string]struct{}) struct {
-	Items []interface{} `json:"items"`
-} {
-	resp := struct {
-		Items []interface{} `json:"items"`
-	}{Items: []interface{}{}}
-
+// fetchRawApplications returns the raw JSON bytes of every application whose key
+// matches one of the object patterns. Values are returned exactly as the watcher
+// stored them in Redis; they are not deserialized, so callers can stream them
+// straight into the response without re-marshaling.
+func fetchRawApplications(redisClient *redis.Client, objectPatterns map[string]struct{}) [][]byte {
 	var allKeys []string
 	for pattern := range objectPatterns {
 		keys, err := scanKeys(redisClient, fmt.Sprintf("%s|*", pattern))
@@ -352,76 +370,63 @@ func fetchApplicationsFromRedis(redisClient *redis.Client, objectPatterns map[st
 		allKeys = append(allKeys, keys...)
 	}
 
-	if len(allKeys) > 0 {
-		pipe := redisClient.Pipeline()
-		cmds := make([]*redis.StringCmd, len(allKeys))
-		for i, key := range allKeys {
-			cmds[i] = pipe.Get(key)
-		}
-		_, err := pipe.Exec()
-		if err != nil && err != redis.Nil {
-			log.Printf("Failed to fetch values for keys: %v", err)
-		}
-
-		for i, cmd := range cmds {
-			if cmd.Err() == nil {
-				var rawJson interface{}
-				if err := json.Unmarshal([]byte(cmd.Val()), &rawJson); err == nil {
-					resp.Items = append(resp.Items, rawJson)
-				} else {
-					log.Printf("Failed to unmarshal value for key %s: %v", allKeys[i], err)
-				}
-			} else {
-				log.Printf("Failed to fetch value for key %s: %v", allKeys[i], cmd.Err())
-			}
-		}
+	if len(allKeys) == 0 {
+		return nil
 	}
-	return resp
+
+	pipe := redisClient.Pipeline()
+	cmds := make([]*redis.StringCmd, len(allKeys))
+	for i, key := range allKeys {
+		cmds[i] = pipe.Get(key)
+	}
+	if _, err := pipe.Exec(); err != nil && err != redis.Nil {
+		log.Printf("Failed to fetch values for keys: %v", err)
+	}
+
+	items := make([][]byte, 0, len(allKeys))
+	for i, cmd := range cmds {
+		val, err := cmd.Result()
+		if err != nil {
+			log.Printf("Failed to fetch value for key %s: %v", allKeys[i], err)
+			continue
+		}
+		items = append(items, []byte(val))
+	}
+	return items
 }
 
-// filterApplicationsByClusterAndNamespace filters application items by destination cluster and/or namespace.
-// The cluster parameter matches against spec.destination.server or spec.destination.name.
-// The namespace parameter matches against spec.destination.namespace.
-// An empty string for either parameter means no filtering is applied for that field.
-// The order of items in the returned slice matches the order of items in the input slice.
-func filterApplicationsByClusterAndNamespace(items []interface{}, cluster, namespace string) []interface{} {
-	if cluster == "" && namespace == "" {
-		return items
-	}
+// filterRawByClusterAndNamespace filters raw application JSON by destination
+// cluster and/or namespace. The cluster parameter matches against
+// spec.destination.server or spec.destination.name; the namespace parameter
+// matches against spec.destination.namespace. Each item is unmarshaled into a
+// minimal struct purely to read the destination, but the original raw bytes are
+// what gets retained, so no re-marshaling occurs. The order of the returned
+// items matches the input order.
+func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [][]byte {
+	filtered := make([][]byte, 0, len(items))
+	for _, raw := range items {
+		var app struct {
+			Spec struct {
+				Destination struct {
+					Server    string `json:"server"`
+					Name      string `json:"name"`
+					Namespace string `json:"namespace"`
+				} `json:"destination"`
+			} `json:"spec"`
+		}
+		if err := json.Unmarshal(raw, &app); err != nil {
+			continue
+		}
+		dest := app.Spec.Destination
 
-	filtered := make([]interface{}, 0)
-	for _, item := range items {
-		app, ok := item.(map[string]interface{})
-		if !ok {
+		if cluster != "" && dest.Server != cluster && dest.Name != cluster {
+			continue
+		}
+		if namespace != "" && dest.Namespace != namespace {
 			continue
 		}
 
-		spec, ok := app["spec"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		destination, ok := spec["destination"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		if cluster != "" {
-			server, _ := destination["server"].(string)
-			name, _ := destination["name"].(string)
-			if server != cluster && name != cluster {
-				continue
-			}
-		}
-
-		if namespace != "" {
-			destNamespace, _ := destination["namespace"].(string)
-			if destNamespace != namespace {
-				continue
-			}
-		}
-
-		filtered = append(filtered, item)
+		filtered = append(filtered, raw)
 	}
 	return filtered
 }
