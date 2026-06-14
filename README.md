@@ -1,25 +1,43 @@
 # argocd-proxy
 
-An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API by integrating with Redis and performing in-memory RBAC filtering. This significantly improves the efficiency of application queries and reduces latency in large-scale environments.
+An **ArgoCD Proxy** that speeds up the ArgoCD list-application API by serving
+`GET /api/v1/applications` from an in-process, always-warm cache instead of
+letting argocd-server enumerate and RBAC-check every application via casbin. All
+other requests are reverse-proxied to argocd-server unchanged.
 
 ## Features
 
-- **Redis Cache Integration**: Reads application data from Redis instead of querying Kubernetes Application CRs.
-- **In-Memory RBAC Filtering**: Drop the use of the [casbin](https://github.com/casbin/casbin) package but use in-memory filtering instead.
-- **Improved Performance**: Optimized for faster response times and reduced resource consumption.
-- **Seamless Integration**: Works in conjunction with [argocd-watcher](https://github.com/hsiaoairplane/argocd-watcher) to keep the Redis cache up-to-date.
+- **In-memory application store**: a Kubernetes informer keeps a live mirror of
+  `Application` objects (trimmed JSON, indexed by project / destination cluster /
+  destination namespace). No external datastore is required.
+- **In-memory RBAC filtering**: resolves the caller's allowed object patterns
+  from the ArgoCD RBAC ConfigMap and filters the store by project (and optional
+  destination cluster/namespace) — dropping
+  [casbin](https://github.com/casbin/casbin) from the read path.
+- **Per-scope precompressed cache**: the assembled `{"items":[...]}` response is
+  cached per RBAC scope, precompressed in **zstd** and **gzip**, and invalidated
+  by a store version counter — so repeat requests are served with no
+  re-assembly and no per-request compression.
+- **Conditional requests**: responses carry an `ETag`; matching `If-None-Match`
+  requests get `304 Not Modified` with no body.
+- **Content negotiation**: serves `zstd`, `gzip`, or identity based on the
+  client's `Accept-Encoding`.
 
 ## Use Cases
 
-- **Scalable API Performance**: Ideal for environments with numerous applications, improving API responsiveness.
-- **Real-Time Application Data**: Provides quick access to updated application information through Redis.
+- **Scalable API performance**: ideal for environments with many applications,
+  where argocd-server's per-request RBAC enforcement and serialization become the
+  bottleneck.
+- **Native ArgoCD Web UI**: a drop-in accelerator for the list endpoint; the
+  live-update stream (`?watch=true`) and every non-list request pass through.
 
 ## Requirements
 
-- **ArgoCD**: A working ArgoCD setup.
-- **Redis**: A running Redis instance to store application data.
-- **Kubernetes**: A Kubernetes cluster where ArgoCD is deployed.
-- **Go**: Installed Go environment for building and running the proxy.
+- **ArgoCD**: a working ArgoCD setup (the proxy reverse-proxies to argocd-server).
+- **Kubernetes**: a cluster where ArgoCD is deployed. The proxy needs a
+  ServiceAccount with `get`/`list`/`watch` on `applications.argoproj.io` and
+  `get` on the ArgoCD RBAC ConfigMap.
+- **Go**: a Go environment for building the proxy.
 
 ## Installation
 
@@ -35,9 +53,10 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
    ```
 
 3. Deploy to Kubernetes:
-   - Ensure Redis is running and accessible.
-   - Configure the proxy to connect to the Redis instance.
-   - Create a Kubernetes deployment for the proxy.
+   - Create a ServiceAccount + (Cluster)Role granting `get,list,watch` on
+     `applications.argoproj.io` and `get` on the RBAC ConfigMap.
+   - Create a Deployment for the proxy, pointing `--proxy-backend` at
+     argocd-server.
 
    Example deployment:
    ```yaml
@@ -55,20 +74,26 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
          labels:
            app: argocd-proxy
        spec:
+         serviceAccountName: argocd-proxy
          containers:
          - name: argocd-proxy
            image: <your-image>
-           command: ["argocd-proxy"]
+           args:
+           - --proxy-backend=http://argocd-server
+           - --namespace=argocd
    ```
 
-4. Run the proxy locally for testing:
+4. Run the proxy locally for testing (uses your current kubeconfig):
    ```bash
-   ./argocd-proxy --redis-addr=<redis-address> --redis-db=<redis-db-index> --proxy-backend=<backend-url>
+   ./argocd-proxy --proxy-backend=<argocd-server-url> --namespace=argocd
    ```
 
 ## Configuration
 
 - **Flags**:
-  - `--redis-addr`: Redis server address (default `localhost:16379`).
-  - `--redis-db`: Redis DB index (default `1`).
-  - `--proxy-backend`: Backend URL for the reverse proxy (default `http://localhost:8080`).
+  - `--proxy-backend`: backend URL for the reverse proxy (default `http://localhost:8080`).
+  - `--listen-addr`: address the proxy listens on (default `:8081`).
+  - `--namespace`: namespace where the ArgoCD RBAC ConfigMap lives and where
+    Applications are watched (default `argocd`).
+  - `--rbac-configmap`: name of the ArgoCD RBAC ConfigMap (default `argocd-rbac-cm`).
+  - `--resync-period`: informer resync period (default `30m`).
