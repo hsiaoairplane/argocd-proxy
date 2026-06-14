@@ -1,61 +1,83 @@
 package main
 
-import "sync"
+import (
+	"bytes"
+	"sync"
+)
 
-type cacheEntry struct {
-	version  uint64
-	etag     string
-	identity []byte
-	gzip     []byte
-	zstd     []byte
+// fragment is one project's applications joined by commas (no {"items":[...]}
+// envelope), precompressed in each encoding. version is the AppStore project
+// version it was built from.
+type fragment struct {
+	version uint64
+	raw     []byte
+	gzip    []byte
+	zstd    []byte
 }
 
-func (e *cacheEntry) variant(enc encoding) []byte {
+func (f *fragment) variant(enc encoding) []byte {
 	switch enc {
 	case encZstd:
-		return e.zstd
+		return f.zstd
 	case encGzip:
-		return e.gzip
+		return f.gzip
 	default:
-		return e.identity
+		return f.raw
 	}
 }
 
-// buildCacheEntry precompresses the body in all supported encodings and computes
-// its ETag, so the request path only has to pick a variant and write it.
-func buildCacheEntry(body []byte, version uint64) *cacheEntry {
-	return &cacheEntry{
-		version:  version,
-		etag:     etag(body),
-		identity: body,
-		gzip:     compress(encGzip, body),
-		zstd:     compress(encZstd, body),
+// joinItems concatenates raw application JSON with commas and no envelope.
+func joinItems(items [][]byte) []byte {
+	if len(items) == 0 {
+		return nil
 	}
+	var b bytes.Buffer
+	for i, it := range items {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(it)
+	}
+	return b.Bytes()
 }
 
-// ResponseCache maps a scope key to its precompressed response. Entries are
-// considered fresh only when their version matches the requested store version.
-type ResponseCache struct {
-	mu      sync.RWMutex
-	entries map[string]*cacheEntry
+// FragmentCache caches one precompressed fragment per project, rebuilt lazily
+// when the project's AppStore version changes.
+type FragmentCache struct {
+	mu    sync.RWMutex
+	frags map[string]*fragment
 }
 
-func NewResponseCache() *ResponseCache {
-	return &ResponseCache{entries: make(map[string]*cacheEntry)}
+func NewFragmentCache() *FragmentCache {
+	return &FragmentCache{frags: make(map[string]*fragment)}
 }
 
-func (c *ResponseCache) Get(key string, version uint64) (*cacheEntry, bool) {
+// Fragment returns the current fragment for a project, rebuilding it (outside
+// the lock) if the cached one is stale.
+func (c *FragmentCache) Fragment(store *AppStore, project string) *fragment {
+	version := store.ProjectVersion(project)
+
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	e, ok := c.entries[key]
-	if !ok || e.version != version {
-		return nil, false
+	cached, ok := c.frags[project]
+	c.mu.RUnlock()
+	if ok && cached.version == version {
+		return cached
 	}
-	return e, true
-}
 
-func (c *ResponseCache) Put(key string, e *cacheEntry) {
+	raw := joinItems(store.ProjectItems(project))
+	built := &fragment{
+		version: version,
+		raw:     raw,
+		gzip:    compress(encGzip, raw),
+		zstd:    compress(encZstd, raw),
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = e
+	// Another goroutine may have built a newer fragment meanwhile.
+	if cur, ok := c.frags[project]; ok && cur.version >= built.version {
+		return cur
+	}
+	c.frags[project] = built
+	return built
 }
