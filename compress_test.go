@@ -60,3 +60,40 @@ func TestCompressRoundTrip(t *testing.T) {
 		t.Errorf("identity must return input unchanged")
 	}
 }
+
+func TestCompressedConsts(t *testing.T) {
+	for _, enc := range []encoding{encIdentity, encGzip, encZstd} {
+		c := compressedConsts[enc]
+		if c.open == nil || c.comma == nil || c.close == nil {
+			t.Fatalf("enc %v: missing precompressed constants", enc)
+		}
+		// Concatenated pieces must decompress to the raw envelope fragments.
+		stream := append(append(append([]byte{}, c.open...), c.comma...), c.close...)
+		got := decodeForTest(t, enc, stream)
+		if string(got) != `{"items":[`+`,`+`]}` {
+			t.Errorf("enc %v: decoded %q", enc, got)
+		}
+	}
+}
+
+func decodeForTest(t *testing.T, enc encoding, b []byte) []byte {
+	t.Helper()
+	switch enc {
+	case encGzip:
+		r, err := gzip.NewReader(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("gzip: %v", err)
+		}
+		out, _ := io.ReadAll(r)
+		return out
+	case encZstd:
+		d, _ := zstd.NewReader(nil)
+		out, err := d.DecodeAll(b, nil)
+		if err != nil {
+			t.Fatalf("zstd: %v", err)
+		}
+		return out
+	default:
+		return b
+	}
+}

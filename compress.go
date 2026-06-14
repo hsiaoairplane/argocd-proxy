@@ -46,6 +46,39 @@ func compress(enc encoding, data []byte) []byte {
 	}
 }
 
+var (
+	openItemsBytes  = []byte(`{"items":[`)
+	commaBytes      = []byte(`,`)
+	closeItemsBytes = []byte(`]}`)
+)
+
+// constPieces holds the precompressed envelope fragments for one encoding.
+type constPieces struct {
+	open  []byte
+	comma []byte
+	close []byte
+}
+
+// compressedConsts holds, per encoding, the precompressed {"items":[ , and ]}
+// pieces, so composed responses never recompress these constants.
+var compressedConsts map[encoding]constPieces
+
+func init() {
+	compressedConsts = map[encoding]constPieces{
+		encIdentity: {open: openItemsBytes, comma: commaBytes, close: closeItemsBytes},
+		encGzip: {
+			open:  compress(encGzip, openItemsBytes),
+			comma: compress(encGzip, commaBytes),
+			close: compress(encGzip, closeItemsBytes),
+		},
+		encZstd: {
+			open:  compress(encZstd, openItemsBytes),
+			comma: compress(encZstd, commaBytes),
+			close: compress(encZstd, closeItemsBytes),
+		},
+	}
+}
+
 // negotiateEncoding picks the best response encoding the client accepts,
 // preferring zstd, then gzip, then identity. Quality values are ignored; a
 // token is treated as accepted if it appears at all.
