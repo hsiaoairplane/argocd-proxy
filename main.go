@@ -76,7 +76,7 @@ func main() {
 
 	dynamicClient := dynamic.NewForConfigOrDie(config)
 	store := NewAppStore()
-	cacheStore := NewResponseCache()
+	fragCache := NewFragmentCache()
 
 	// Handle SIGINT/SIGTERM for graceful shutdown and informer lifecycle.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -94,7 +94,7 @@ func main() {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
-		if served := tryServeList(rw, r, store, cacheStore, userToObjectPatternMapping, groupToObjectPatternMapping); !served {
+		if served := tryServeList(rw, r, store, fragCache, userToObjectPatternMapping, groupToObjectPatternMapping); !served {
 			proxy.ServeHTTP(rw, r)
 		}
 
