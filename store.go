@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"sync"
 )
 
@@ -52,6 +53,40 @@ func (s *AppStore) Delete(id string) {
 	}
 	delete(s.apps, id)
 	s.version++
+}
+
+// Items returns the raw JSON of every stored application whose project matches
+// one of patterns (the literal "*" matches all projects) and, when non-empty,
+// whose destination matches cluster and namespace. Results are sorted by id for
+// deterministic output (stable ETags).
+func (s *AppStore) Items(patterns map[string]struct{}, cluster, namespace string) [][]byte {
+	_, all := patterns["*"]
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	ids := make([]string, 0, len(s.apps))
+	for id, e := range s.apps {
+		if !all {
+			if _, ok := patterns[e.project]; !ok {
+				continue
+			}
+		}
+		if cluster != "" && e.cluster != cluster && e.clusterNm != cluster {
+			continue
+		}
+		if namespace != "" && e.namespace != namespace {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	items := make([][]byte, len(ids))
+	for i, id := range ids {
+		items[i] = s.apps[id].raw
+	}
+	return items
 }
 
 func parseAppEntry(raw []byte) appEntry {
