@@ -1,6 +1,12 @@
 package main
 
-import "strings"
+import (
+	"bytes"
+	"compress/gzip"
+	"strings"
+
+	"github.com/klauspost/compress/zstd"
+)
 
 type encoding int
 
@@ -18,6 +24,25 @@ func (e encoding) header() string {
 		return "gzip"
 	default:
 		return ""
+	}
+}
+
+// zstdEncoder is safe for concurrent use via EncodeAll.
+var zstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+
+// compress returns data encoded with enc. encIdentity returns data unchanged.
+func compress(enc encoding, data []byte) []byte {
+	switch enc {
+	case encZstd:
+		return zstdEncoder.EncodeAll(data, make([]byte, 0, len(data)/3))
+	case encGzip:
+		var buf bytes.Buffer
+		gw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+		_, _ = gw.Write(data)
+		_ = gw.Close()
+		return buf.Bytes()
+	default:
+		return data
 	}
 }
 
