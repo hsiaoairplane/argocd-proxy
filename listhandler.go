@@ -3,10 +3,11 @@ package main
 import "net/http"
 
 // tryServeList intercepts the list endpoint for authenticated callers and serves
-// it from the store/cache. It returns false when the request is not an
-// interceptable list call, the token is missing/unparseable, or the scope is
-// empty — in all those cases the caller falls through to the reverse proxy.
-func tryServeList(w http.ResponseWriter, r *http.Request, store *AppStore, cache *ResponseCache, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) bool {
+// it from the in-memory store. Returns false when the request is not an
+// interceptable list call, or the token is missing/unparseable, or the caller's
+// RBAC resolves to no patterns — in which case the caller falls through to the
+// reverse proxy.
+func tryServeList(w http.ResponseWriter, r *http.Request, store *AppStore, fc *FragmentCache, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) bool {
 	token := extractToken(r)
 	if token == "" || !shouldInterceptListRequest(r) {
 		return false
@@ -21,39 +22,37 @@ func tryServeList(w http.ResponseWriter, r *http.Request, store *AppStore, cache
 	if len(patterns) == 0 {
 		return false
 	}
-	return serveApplicationList(w, r, store, cache, patterns)
+	return serveApplicationList(w, r, store, fc, patterns)
 }
 
-// serveApplicationList writes the cached, precompressed application list for the
-// caller's scope. It returns false (writing nothing) only for an *unfiltered*
-// query that resolves to zero applications, so the caller can fall through to the
-// backend proxy — preserving the original "empty cache -> proxy" behavior. A
-// cluster/namespace filter that matches nothing is instead a valid empty result
-// ({"items":[]}): falling through there would let the backend ignore the filter
-// and return the full list.
-func serveApplicationList(w http.ResponseWriter, r *http.Request, store *AppStore, cache *ResponseCache, patterns map[string]struct{}) bool {
+// serveApplicationList serves the application list for the caller's scope. A
+// cluster/namespace filter is computed on demand (small result); an unfiltered
+// scope is composed from per-project precompressed fragments.
+func serveApplicationList(w http.ResponseWriter, r *http.Request, store *AppStore, fc *FragmentCache, patterns map[string]struct{}) bool {
 	q := r.URL.Query()
 	cluster, namespace := q.Get("cluster"), q.Get("namespace")
-	filtered := cluster != "" || namespace != ""
-	key := scopeKey(patterns, cluster, namespace)
-	version := store.Version()
+	if cluster != "" || namespace != "" {
+		return serveFiltered(w, r, store, patterns, cluster, namespace)
+	}
+	return serveComposed(w, r, store, fc, patterns)
+}
 
-	entry, ok := cache.Get(key, version)
-	if !ok {
-		items := store.Items(patterns, cluster, namespace)
-		if len(items) == 0 && !filtered {
-			return false
-		}
-		entry = buildCacheEntry(assembleItems(items), version)
-		cache.Put(key, entry)
+// serveComposed streams the unfiltered scope by concatenating per-project
+// precompressed fragments. It returns false (fall through) only when the scope
+// contains no projects at all (e.g. an empty store under a "*" pattern).
+func serveComposed(w http.ResponseWriter, r *http.Request, store *AppStore, fc *FragmentCache, patterns map[string]struct{}) bool {
+	projects := resolveProjects(patterns, store)
+	if len(projects) == 0 {
+		return false
 	}
 
+	etag := composeETag(store, projects)
 	h := w.Header()
-	h.Set("ETag", entry.etag)
+	h.Set("ETag", etag)
 	h.Set("Vary", "Accept-Encoding")
 	h.Set("Content-Type", "application/json")
 
-	if match := r.Header.Get("If-None-Match"); match == entry.etag {
+	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return true
 	}
@@ -63,6 +62,32 @@ func serveApplicationList(w http.ResponseWriter, r *http.Request, store *AppStor
 		h.Set("Content-Encoding", hdr)
 	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(entry.variant(enc))
+	writeComposedList(w, enc, store, fc, projects)
+	return true
+}
+
+// serveFiltered handles a cluster/namespace-filtered query by computing the
+// (small) result on demand. An empty result returns 200 {"items":[]} rather than
+// falling through to the backend, which ignores these filters.
+func serveFiltered(w http.ResponseWriter, r *http.Request, store *AppStore, patterns map[string]struct{}, cluster, namespace string) bool {
+	body := assembleItems(store.Items(patterns, cluster, namespace))
+	et := etag(body)
+
+	h := w.Header()
+	h.Set("ETag", et)
+	h.Set("Vary", "Accept-Encoding")
+	h.Set("Content-Type", "application/json")
+
+	if r.Header.Get("If-None-Match") == et {
+		w.WriteHeader(http.StatusNotModified)
+		return true
+	}
+
+	enc := negotiateEncoding(r.Header.Get("Accept-Encoding"))
+	if hdr := enc.header(); hdr != "" {
+		h.Set("Content-Encoding", hdr)
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(compress(enc, body))
 	return true
 }
