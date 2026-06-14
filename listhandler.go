@@ -25,19 +25,23 @@ func tryServeList(w http.ResponseWriter, r *http.Request, store *AppStore, cache
 }
 
 // serveApplicationList writes the cached, precompressed application list for the
-// caller's scope. It returns false (writing nothing) when the scope resolves to
-// zero applications, so the caller can fall through to the backend proxy — this
-// preserves the existing "empty cache -> proxy" behavior.
+// caller's scope. It returns false (writing nothing) only for an *unfiltered*
+// query that resolves to zero applications, so the caller can fall through to the
+// backend proxy — preserving the original "empty cache -> proxy" behavior. A
+// cluster/namespace filter that matches nothing is instead a valid empty result
+// ({"items":[]}): falling through there would let the backend ignore the filter
+// and return the full list.
 func serveApplicationList(w http.ResponseWriter, r *http.Request, store *AppStore, cache *ResponseCache, patterns map[string]struct{}) bool {
 	q := r.URL.Query()
 	cluster, namespace := q.Get("cluster"), q.Get("namespace")
+	filtered := cluster != "" || namespace != ""
 	key := scopeKey(patterns, cluster, namespace)
 	version := store.Version()
 
 	entry, ok := cache.Get(key, version)
 	if !ok {
 		items := store.Items(patterns, cluster, namespace)
-		if len(items) == 0 {
+		if len(items) == 0 && !filtered {
 			return false
 		}
 		entry = buildCacheEntry(assembleItems(items), version)

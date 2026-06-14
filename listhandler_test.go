@@ -60,6 +60,31 @@ func TestServeApplicationListReturnsFalseWhenEmpty(t *testing.T) {
 	if served := serveApplicationList(httptest.NewRecorder(),
 		httptest.NewRequest(http.MethodGet, "/api/v1/applications", nil),
 		store, NewResponseCache(), map[string]struct{}{"*": {}}); served {
-		t.Error("expected serveApplicationList to report not-served for empty scope")
+		t.Error("expected serveApplicationList to report not-served for empty unfiltered scope")
+	}
+}
+
+func TestServeApplicationListEmptyFilterReturnsEmptyList(t *testing.T) {
+	store, cache := newListDeps() // has apps in ns-1 / ns-2 only
+	patterns := map[string]struct{}{"*": {}}
+
+	// A namespace/cluster filter that matches nothing is a valid empty result.
+	// It must return 200 {"items":[]}, NOT fall through to the backend — the
+	// backend ignores these filters and would return the full list instead.
+	for _, query := range []string{"?namespace=does-not-exist", "?cluster=https://nope"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/applications"+query, nil)
+		rec := httptest.NewRecorder()
+
+		served := serveApplicationList(rec, req, store, cache, patterns)
+
+		if !served {
+			t.Fatalf("%s: filtered empty result must be served, not fall through", query)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", query, rec.Code)
+		}
+		if body := rec.Body.String(); body != `{"items":[]}` {
+			t.Errorf("%s: body = %q, want {\"items\":[]}", query, body)
+		}
 	}
 }
