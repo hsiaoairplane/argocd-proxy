@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -203,63 +202,6 @@ func createReverseProxy(target string) *httputil.ReverseProxy {
 // unchanged.
 func shouldInterceptListRequest(r *http.Request) bool {
 	return r.Method == http.MethodGet && r.URL.Path == listApplicationsPath
-}
-
-// writeApplicationList streams the cached applications as a {"items":[...]}
-// envelope. Each element is the raw JSON the informer already stored, so
-// no per-application marshaling happens here; the bytes are concatenated
-// directly. This is the hot path for large, unfiltered list responses.
-func writeApplicationList(w http.ResponseWriter, items [][]byte) {
-	bw := bufio.NewWriter(w)
-	bw.WriteString(`{"items":[`)
-	for i, raw := range items {
-		if i > 0 {
-			bw.WriteByte(',')
-		}
-		bw.Write(raw)
-	}
-	bw.WriteString("]}")
-	if err := bw.Flush(); err != nil {
-		// Headers and a partial body may already be written, so we cannot fall
-		// back to the proxy here; just log the failure.
-		log.Errorf("Failed to write response: %v", err)
-	}
-}
-
-// filterRawByClusterAndNamespace filters raw application JSON by destination
-// cluster and/or namespace. The cluster parameter matches against
-// spec.destination.server or spec.destination.name; the namespace parameter
-// matches against spec.destination.namespace. Each item is unmarshaled into a
-// minimal struct purely to read the destination, but the original raw bytes are
-// what gets retained, so no re-marshaling occurs. The order of the returned
-// items matches the input order.
-func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [][]byte {
-	filtered := make([][]byte, 0, len(items))
-	for _, raw := range items {
-		var app struct {
-			Spec struct {
-				Destination struct {
-					Server    string `json:"server"`
-					Name      string `json:"name"`
-					Namespace string `json:"namespace"`
-				} `json:"destination"`
-			} `json:"spec"`
-		}
-		if err := json.Unmarshal(raw, &app); err != nil {
-			continue
-		}
-		dest := app.Spec.Destination
-
-		if cluster != "" && dest.Server != cluster && dest.Name != cluster {
-			continue
-		}
-		if namespace != "" && dest.Namespace != namespace {
-			continue
-		}
-
-		filtered = append(filtered, raw)
-	}
-	return filtered
 }
 
 // extractGroups reads the "groups" claim from a decoded JWT payload. JSON arrays
