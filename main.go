@@ -8,11 +8,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -249,7 +252,39 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 		items = filterRawByClusterAndNamespace(items, cluster, namespace)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	serveCachedList(w, r, items)
+}
+
+// computeETag returns a strong, quoted ETag over the application list body, so an
+// unchanged response can be answered with 304 Not Modified. fetchRawApplications
+// sorts its keys, so the body — and therefore this ETag — is stable across
+// requests when the underlying data has not changed.
+func computeETag(items [][]byte) string {
+	h := fnv.New64a()
+	h.Write([]byte(`{"items":[`))
+	for i, raw := range items {
+		if i > 0 {
+			h.Write([]byte{','})
+		}
+		h.Write(raw)
+	}
+	h.Write([]byte("]}"))
+	return `"` + strconv.FormatUint(h.Sum64(), 16) + `"`
+}
+
+// serveCachedList writes the application list with an ETag. A request whose
+// If-None-Match matches the current ETag gets 304 Not Modified with no body,
+// saving the (potentially large) response transfer when nothing has changed.
+func serveCachedList(w http.ResponseWriter, r *http.Request, items [][]byte) {
+	etag := computeETag(items)
+	h := w.Header()
+	h.Set("ETag", etag)
+	h.Set("Content-Type", "application/json")
+
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	writeApplicationList(w, items)
 }
 
@@ -373,6 +408,9 @@ func fetchRawApplications(redisClient *redis.Client, objectPatterns map[string]s
 	if len(allKeys) == 0 {
 		return nil
 	}
+	// Redis SCAN returns keys in an unspecified order; sort so the response body
+	// — and the ETag computed from it — are deterministic across requests.
+	sort.Strings(allKeys)
 
 	pipe := redisClient.Pipeline()
 	cmds := make([]*redis.StringCmd, len(allKeys))
