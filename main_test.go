@@ -551,3 +551,71 @@ func compareMaps(a, b map[string]interface{}) bool {
 	}
 	return true
 }
+
+func TestComputeETag(t *testing.T) {
+	a := [][]byte{[]byte(`{"metadata":{"name":"a"}}`), []byte(`{"metadata":{"name":"b"}}`)}
+
+	e := computeETag(a)
+	if computeETag(a) != e {
+		t.Error("etag not stable for identical items")
+	}
+	// Different content -> different etag.
+	b := [][]byte{[]byte(`{"metadata":{"name":"a"}}`), []byte(`{"metadata":{"name":"c"}}`)}
+	if computeETag(b) == e {
+		t.Error("etag collided for different items")
+	}
+	// Must be a quoted strong ETag.
+	if len(e) < 2 || e[0] != '"' || e[len(e)-1] != '"' {
+		t.Errorf("etag must be quoted, got %s", e)
+	}
+	// Empty items still produce a stable etag.
+	if computeETag(nil) != computeETag([][]byte{}) {
+		t.Error("empty etag not stable")
+	}
+}
+
+func TestServeCachedList(t *testing.T) {
+	items := [][]byte{[]byte(`{"metadata":{"name":"a"}}`), []byte(`{"metadata":{"name":"b"}}`)}
+
+	// First request: 200 with ETag + full body.
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/applications", nil)
+	rec := httptest.NewRecorder()
+	serveCachedList(rec, req, items)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	et := rec.Header().Get("ETag")
+	if et == "" {
+		t.Fatal("missing ETag")
+	}
+	if rec.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("missing Content-Type")
+	}
+	if got, want := rec.Body.String(), `{"items":[{"metadata":{"name":"a"}},{"metadata":{"name":"b"}}]}`; got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+
+	// Conditional request with matching ETag: 304, empty body, ETag still present.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/applications", nil)
+	req2.Header.Set("If-None-Match", et)
+	rec2 := httptest.NewRecorder()
+	serveCachedList(rec2, req2, items)
+	if rec2.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", rec2.Code)
+	}
+	if rec2.Body.Len() != 0 {
+		t.Errorf("304 body must be empty, got %d bytes", rec2.Body.Len())
+	}
+	if rec2.Header().Get("ETag") != et {
+		t.Errorf("304 should still carry the ETag")
+	}
+
+	// Stale If-None-Match -> 200 with body.
+	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/applications", nil)
+	req3.Header.Set("If-None-Match", `"stale"`)
+	rec3 := httptest.NewRecorder()
+	serveCachedList(rec3, req3, items)
+	if rec3.Code != http.StatusOK {
+		t.Errorf("stale If-None-Match should be 200, got %d", rec3.Code)
+	}
+}
