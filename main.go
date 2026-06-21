@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -503,6 +504,23 @@ func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [
 	return filtered
 }
 
+// parseCSVLine tokenizes a single ArgoCD RBAC policy.csv line into its
+// comma-separated fields, honoring quoted values so commas inside a quoted
+// field (e.g. an LDAP group DN like "cn=foo,ou=bar,dc=example,dc=com") are
+// not treated as field separators.
+func parseCSVLine(line string) ([]string, error) {
+	reader := csv.NewReader(strings.NewReader(line))
+	reader.TrimLeadingSpace = true
+	fields, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+	for i := range fields {
+		fields[i] = strings.TrimSpace(fields[i])
+	}
+	return fields, nil
+}
+
 func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string) {
 	userToRoleMapping := make(map[string][]string)
 	groupToRoleMapping := make(map[string][]string)
@@ -522,10 +540,13 @@ func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string)
 			continue
 		}
 
-		// Split the line into fields
-		fields := strings.Split(line, ",")
-		for i := range fields {
-			fields[i] = strings.TrimSpace(fields[i]) // Trim spaces around each field
+		// Split the line into fields, respecting quoted values so that
+		// fields containing literal commas (e.g. LDAP group DNs) parse
+		// as a single field instead of being split apart.
+		fields, err := parseCSVLine(line)
+		if err != nil {
+			log.Warnf("Skipping malformed RBAC policy line %q: %v", line, err)
+			continue
 		}
 
 		// Process "g" entries (group-role mappings)
