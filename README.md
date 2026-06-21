@@ -72,3 +72,8 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
   - `--redis-addr`: Redis server address (default `localhost:16379`).
   - `--redis-db`: Redis DB index (default `1`).
   - `--proxy-backend`: Backend URL for the reverse proxy (default `http://localhost:8080`).
+  - `--namespace`: Namespace where the ArgoCD RBAC ConfigMap and Secret live (default `argocd`).
+  - `--rbac-configmap`: Name of the ArgoCD RBAC ConfigMap (default `argocd-rbac-cm`).
+  - `--argocd-secret`: Name of the ArgoCD Secret holding the session-signing key, `server.secretkey` (default `argocd-secret`).
+
+- **Session token verification**: Requests to the cached `/api/v1/applications` list endpoint carry an ArgoCD session JWT, which the proxy verifies (HS256) against `server.secretkey` from the ArgoCD Secret before trusting any of its claims. The proxy's ServiceAccount needs `get` on that Secret in addition to the RBAC ConfigMap; if the key can't be loaded, the cached fast path is disabled and every request falls back to the real ArgoCD backend, which still enforces its own RBAC.

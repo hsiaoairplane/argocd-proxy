@@ -7,8 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/golang-jwt/jwt/v5"
 )
+
+const testSigningKey = "test-signing-key"
 
 func TestParsePolicyCSV(t *testing.T) {
 	tests := []struct {
@@ -267,36 +272,58 @@ func TestExtractToken(t *testing.T) {
 	}
 }
 
-func TestDecodeJWTPayload(t *testing.T) {
+func TestVerifyAndDecodeJWT(t *testing.T) {
+	signingKey := []byte(testSigningKey)
+
 	tests := []struct {
 		name           string
 		token          string
+		signingKey     []byte
 		expected       map[string]interface{}
 		expectingError bool
 	}{
 		{
-			name:           "Valid JWT Token",
+			name:           "Valid signed token",
 			token:          createTestJWT(map[string]interface{}{"email": "test@example.com", "role": "admin"}),
+			signingKey:     signingKey,
 			expected:       map[string]interface{}{"email": "test@example.com", "role": "admin"},
 			expectingError: false,
 		},
 		{
-			name:           "Invalid JWT Token Format",
-			token:          "invalid.token",
-			expected:       nil,
+			name:           "Wrong signing key is rejected",
+			token:          createTestJWT(map[string]interface{}{"email": "test@example.com"}),
+			signingKey:     []byte("a-different-key"),
 			expectingError: true,
 		},
 		{
-			name:           "Invalid Payload Encoding",
-			token:          "header." + base64.RawURLEncoding.EncodeToString([]byte("invalid payload")) + ".signature",
-			expected:       nil,
+			name:           "No signing key configured",
+			token:          createTestJWT(map[string]interface{}{"email": "test@example.com"}),
+			signingKey:     nil,
+			expectingError: true,
+		},
+		{
+			name:           "alg=none token is rejected",
+			token:          unsignedNoneAlgToken(map[string]interface{}{"email": "attacker@example.com", "role": "admin"}),
+			signingKey:     signingKey,
+			expectingError: true,
+		},
+		{
+			name:           "Tampered payload is rejected",
+			token:          tamperPayload(createTestJWT(map[string]interface{}{"email": "test@example.com"})),
+			signingKey:     signingKey,
+			expectingError: true,
+		},
+		{
+			name:           "Malformed token",
+			token:          "not-a-jwt",
+			signingKey:     signingKey,
 			expectingError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			payload, err := decodeJWTPayload(tt.token)
+			payload, err := verifyAndDecodeJWT(tt.token, tt.signingKey)
 
 			if tt.expectingError && err == nil {
 				t.Errorf("Expected an error but got none")
@@ -313,11 +340,32 @@ func TestDecodeJWTPayload(t *testing.T) {
 	}
 }
 
+// createTestJWT signs payload with testSigningKey using HS256, mirroring how
+// ArgoCD signs its own session tokens.
 func createTestJWT(payload map[string]interface{}) string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(payload))
+	signed, err := token.SignedString([]byte(testSigningKey))
+	if err != nil {
+		panic(err)
+	}
+	return signed
+}
+
+// unsignedNoneAlgToken builds a token asserting alg=none with an empty
+// signature, the classic JWT algorithm-confusion forgery.
+func unsignedNoneAlgToken(payload map[string]interface{}) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payloadBytes, _ := json.Marshal(payload)
 	encodedPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
-	return header + "." + encodedPayload + ".signature"
+	return header + "." + encodedPayload + "."
+}
+
+// tamperPayload swaps in a different payload while keeping the original
+// header and signature, simulating an attacker editing claims in place.
+func tamperPayload(token string) string {
+	parts := strings.Split(token, ".")
+	tampered := base64.RawURLEncoding.EncodeToString([]byte(`{"email":"attacker@example.com"}`))
+	return parts[0] + "." + tampered + "." + parts[2]
 }
 
 func TestFilterRawByClusterAndNamespace(t *testing.T) {
@@ -504,9 +552,9 @@ func TestExtractGroupsFromDecodedJWT(t *testing.T) {
 		"groups": []string{"team-a", "team-b"},
 	})
 
-	payload, err := decodeJWTPayload(token)
+	payload, err := verifyAndDecodeJWT(token, []byte(testSigningKey))
 	if err != nil {
-		t.Fatalf("decodeJWTPayload() unexpected error: %v", err)
+		t.Fatalf("verifyAndDecodeJWT() unexpected error: %v", err)
 	}
 
 	groups := extractGroups(payload)
