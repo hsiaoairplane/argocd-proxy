@@ -534,6 +534,8 @@ func TestMatchesObjectPattern(t *testing.T) {
 		{name: "Exact match", pattern: "myproj/myapp", object: "myproj/myapp", expected: true},
 		{name: "Prefix glob within project", pattern: "myproj/alpha-*", object: "myproj/alpha-1", expected: true},
 		{name: "Prefix glob does not match other prefix", pattern: "myproj/alpha-*", object: "myproj/beta-1", expected: false},
+		{name: "Wildcard without slash still matches across project/app boundary", pattern: "myproj-*", object: "myproj-team/myapp", expected: true},
+		{name: "Invalid pattern does not match", pattern: "[", object: "myproj/myapp", expected: false},
 	}
 
 	for _, tt := range tests {

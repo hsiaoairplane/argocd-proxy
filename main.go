@@ -14,10 +14,10 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +26,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/go-redis/redis/v7"
+	"github.com/gobwas/glob"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -535,16 +536,38 @@ func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [
 	return filtered
 }
 
-// matchesObjectPattern reports whether object (typically "<project>/<name>")
-// matches an ArgoCD-style glob pattern. "*" is treated as matching everything,
-// including objects containing "/", which path.Match would otherwise reject
-// since "/" is a segment separator for it.
-func matchesObjectPattern(pattern, object string) bool {
-	if pattern == "*" {
-		return true
+// globCache memoizes compiled glob patterns; the same deny pattern is reused
+// across many requests (and many items within a request), so compiling once
+// per distinct pattern avoids recompiling on every call.
+var globCache sync.Map // map[string]glob.Glob
+
+// compileObjectGlob compiles pattern with no path separators configured, so
+// "*" matches across "/" just like ArgoCD's own RBAC enforcer (which uses
+// gobwas/glob the same way). This matters because deny patterns are matched
+// against "<project>/<name>" objects, and a pattern without an explicit "/"
+// (e.g. "team-*" instead of "team-*/*") must still be able to match through
+// the "/" to agree with ArgoCD's policy semantics.
+func compileObjectGlob(pattern string) (glob.Glob, error) {
+	if g, ok := globCache.Load(pattern); ok {
+		return g.(glob.Glob), nil
 	}
-	matched, err := path.Match(pattern, object)
-	return err == nil && matched
+	g, err := glob.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	globCache.Store(pattern, g)
+	return g, nil
+}
+
+// matchesObjectPattern reports whether object (typically "<project>/<name>")
+// matches an ArgoCD-style glob pattern.
+func matchesObjectPattern(pattern, object string) bool {
+	g, err := compileObjectGlob(pattern)
+	if err != nil {
+		log.Printf("Failed to compile object pattern %q: %v", pattern, err)
+		return false
+	}
+	return g.Match(object)
 }
 
 // excludeDenied removes applications matching any deny pattern from items.
