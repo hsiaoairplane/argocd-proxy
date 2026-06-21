@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,10 +24,16 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/go-redis/redis/v7"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
 )
+
+// argoCDSecretKeyField is the data key in the ArgoCD secret holding the HMAC
+// key ArgoCD uses to sign session JWTs (both local-user and SSO sessions go
+// through ArgoCD's own session manager, which always signs with this key).
+const argoCDSecretKeyField = "server.secretkey"
 
 const listApplicationsPath = "/api/v1/applications"
 
@@ -66,6 +71,7 @@ func main() {
 	listenAddr := flag.String("listen-addr", ":8081", "Address the proxy listens on")
 	namespace := flag.String("namespace", "argocd", "Namespace where the ArgoCD RBAC ConfigMap lives")
 	rbacConfigMap := flag.String("rbac-configmap", "argocd-rbac-cm", "Name of the ArgoCD RBAC ConfigMap")
+	argocdSecret := flag.String("argocd-secret", "argocd-secret", "Name of the ArgoCD Secret holding the session-signing key (server.secretkey)")
 
 	// Parse command-line flags
 	flag.Parse()
@@ -78,6 +84,10 @@ func main() {
 	}
 
 	userToObjectPatternMapping, groupToObjectPatternMapping := loadRBACPolicyFromConfigMap(clientset, *namespace, *rbacConfigMap)
+	signingKey := loadSigningKeyFromSecret(clientset, *namespace, *argocdSecret)
+	if len(signingKey) == 0 {
+		log.Errorf("No JWT signing key available; the cached list-applications fast path is disabled and all requests will be proxied to the backend")
+	}
 
 	// Initialize Redis client
 	redisClient := initializeRedis(*redisAddr, *redisDB)
@@ -90,7 +100,7 @@ func main() {
 		start := time.Now() // Start measuring time
 
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		handleRequest(rw, r, proxy, redisClient, userToObjectPatternMapping, groupToObjectPatternMapping)
+		handleRequest(rw, r, proxy, redisClient, signingKey, userToObjectPatternMapping, groupToObjectPatternMapping)
 
 		// Record duration and total request count
 		duration := float64(time.Since(start).Milliseconds())
@@ -175,6 +185,25 @@ func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, con
 	return parsePolicyCSV(policyCSV)
 }
 
+// loadSigningKeyFromSecret fetches the HMAC key ArgoCD uses to sign session
+// JWTs from the ArgoCD Secret. Without this key the proxy cannot verify the
+// authenticity of a token's claims, so callers must treat a nil/empty result
+// as "verification unavailable" rather than trusting unverified claims.
+func loadSigningKeyFromSecret(clientset *kubernetes.Clientset, namespace, secretName string) []byte {
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(context.Background(), secretName, metav1.GetOptions{})
+	if err != nil {
+		log.Errorf("Failed to fetch Secret %s: %v", secretName, err)
+		return nil
+	}
+
+	key, ok := secret.Data[argoCDSecretKeyField]
+	if !ok || len(key) == 0 {
+		log.Errorf("%s not found in Secret %s", argoCDSecretKeyField, secretName)
+		return nil
+	}
+	return key
+}
+
 func initializeRedis(addr string, db int) *redis.Client {
 	client := redis.NewClient(&redis.Options{
 		Addr:        addr,
@@ -221,16 +250,16 @@ func shouldInterceptListRequest(r *http.Request) bool {
 	return r.Method == http.MethodGet && r.URL.Path == listApplicationsPath
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
+func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, signingKey []byte, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
 	token := extractToken(r)
 	if token == "" || !shouldInterceptListRequest(r) {
 		proxy.ServeHTTP(w, r)
 		return
 	}
 
-	payload, err := decodeJWTPayload(token)
+	payload, err := verifyAndDecodeJWT(token, signingKey)
 	if err != nil {
-		log.Errorf("Failed to decode JWT payload: %v\n", err)
+		log.Errorf("Failed to verify JWT: %v\n", err)
 		proxy.ServeHTTP(w, r)
 		return
 	}
@@ -336,22 +365,27 @@ func extractToken(r *http.Request) string {
 	return ""
 }
 
-func decodeJWTPayload(token string) (map[string]interface{}, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("invalid token format")
+// verifyAndDecodeJWT verifies the token's HMAC signature against signingKey
+// and returns its claims. The signing method is pinned to HS256 so a forged
+// token cannot switch to "none" or otherwise smuggle an unverified signature
+// past this check (the classic JWT algorithm-confusion attack); the standard
+// exp/nbf/iat claims are validated by the underlying library when present.
+func verifyAndDecodeJWT(token string, signingKey []byte) (map[string]interface{}, error) {
+	if len(signingKey) == 0 {
+		return nil, fmt.Errorf("no signing key configured")
 	}
 
-	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	claims := jwt.MapClaims{}
+	parsed, err := jwt.ParseWithClaims(token, claims, func(*jwt.Token) (interface{}, error) {
+		return signingKey, nil
+	}, jwt.WithValidMethods([]string{"HS256"}))
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode payload: %v", err)
+		return nil, fmt.Errorf("failed to verify token: %w", err)
 	}
-
-	var payload map[string]interface{}
-	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal payload: %v", err)
+	if !parsed.Valid {
+		return nil, fmt.Errorf("invalid token")
 	}
-	return payload, nil
+	return claims, nil
 }
 
 func resolveObjectPatterns(email string, groups []string, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) map[string]struct{} {
