@@ -161,9 +161,12 @@ func TestParsePolicyCSV(t *testing.T) {
 			},
 		},
 		{
-			name: "Resource types unrelated to applications are ignored",
+			name: "Resource types other than applications are ignored",
 			policyCSV: `
 				p, team-alpha, clusters, get, https://example.com, allow
+				p, team-alpha, applicationsets, get, alpha-*, allow
+				p, team-alpha, logs, get, alpha-*, allow
+				p, team-alpha, exec, create, alpha-*, allow
 				g, alpha@gmail.com, team-alpha
 			`,
 			expectedUserToObjectPatternMapping: map[string]rbacPolicy{

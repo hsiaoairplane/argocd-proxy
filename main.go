@@ -48,16 +48,12 @@ type rbacPolicy struct {
 	deny  []string
 }
 
-// allowedResources are the ArgoCD RBAC resource types that gate visibility of
-// items in the cached application list. Rules for other resource types (e.g.
-// "clusters", "certificates") don't affect which applications are returned by
-// this proxy, so they are ignored by parsePolicyCSV.
-var allowedResources = map[string]bool{
-	"applications":    true,
-	"applicationsets": true,
-	"logs":            true,
-	"exec":            true,
-}
+// applicationsResource is the only ArgoCD RBAC resource type that gates
+// visibility of items in the cached application list. The proxy only ever
+// serves /api/v1/applications, so "p" rules for other resource types (e.g.
+// "applicationsets", "logs", "exec", "clusters") are out of scope and ignored
+// by parsePolicyCSV.
+const applicationsResource = "applications"
 
 // Define Prometheus metrics for HTTP request duration (milliseconds) and total request count.
 var requestDuration = prometheus.NewHistogramVec(
@@ -632,9 +628,9 @@ func resolveReachableRoles(subject string, edges map[string][]string) []string {
 // "@") and one for groups. "g" lines are also used to build a generic
 // subject-to-role graph so role-to-role inheritance (e.g.
 // "g, role:org-admin, role:admin") is resolved transitively, not just one
-// level deep. Only "p" rules for resource types that affect application
-// visibility (allowedResources) contribute object patterns; rules for other
-// resource types (e.g. "clusters") are ignored.
+// level deep. Only "p" rules for the "applications" resource contribute
+// object patterns; rules for other resource types (e.g. "applicationsets",
+// "logs", "exec", "clusters") are out of scope for this proxy and ignored.
 func parsePolicyCSV(policyCSV string) (map[string]rbacPolicy, map[string]rbacPolicy) {
 	// subjectEdges records every "g, subject, role" edge. It doubles as the
 	// graph resolveReachableRoles walks for role-to-role inheritance, since a
@@ -691,7 +687,7 @@ func parsePolicyCSV(policyCSV string) (map[string]rbacPolicy, map[string]rbacPol
 				effect = strings.ToLower(fields[5])
 			}
 
-			if !allowedResources[resource] {
+			if resource != applicationsResource {
 				continue
 			}
 
