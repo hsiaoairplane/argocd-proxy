@@ -534,6 +534,7 @@ func TestMatchesObjectPattern(t *testing.T) {
 		{name: "Exact match", pattern: "myproj/myapp", object: "myproj/myapp", expected: true},
 		{name: "Prefix glob within project", pattern: "myproj/alpha-*", object: "myproj/alpha-1", expected: true},
 		{name: "Prefix glob does not match other prefix", pattern: "myproj/alpha-*", object: "myproj/beta-1", expected: false},
+		{name: "Matching is case-insensitive", pattern: "MyProj/Alpha-*", object: "myproj/alpha-1", expected: true},
 	}
 
 	for _, tt := range tests {
@@ -595,6 +596,28 @@ func TestExcludeDenied(t *testing.T) {
 				if !bytes.Equal(item, tt.expected[i]) {
 					t.Errorf("excludeDenied()[%d] = %s, want %s", i, item, tt.expected[i])
 				}
+			}
+		})
+	}
+}
+
+func TestCaseInsensitiveGlob(t *testing.T) {
+	tests := []struct {
+		name     string
+		pattern  string
+		expected string
+	}{
+		{name: "Lowercase letters expand into bracket classes", pattern: "alpha1-*", expected: "[aA][lL][pP][hH][aA]1-*"},
+		{name: "Mixed case letters expand into bracket classes", pattern: "Alpha-Web", expected: "[Aa][lL][pP][hH][aA]-[Ww][eE][bB]"},
+		{name: "Existing bracket class is preserved", pattern: "team[12]-*", expected: "[tT][eE][aA][mM][12]-*"},
+		{name: "Escaped characters are preserved", pattern: `team\*-*`, expected: `[tT][eE][aA][mM]\*-*`},
+		{name: "Bare wildcard is unchanged", pattern: "*", expected: "*"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if result := caseInsensitiveGlob(tt.pattern); result != tt.expected {
+				t.Errorf("caseInsensitiveGlob(%q) = %q, want %q", tt.pattern, result, tt.expected)
 			}
 		})
 	}

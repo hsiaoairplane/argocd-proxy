@@ -436,6 +436,47 @@ func resolveObjectPatterns(email string, groups []string, userToObjectPatternMap
 	return allow, deny
 }
 
+// caseInsensitiveGlob rewrites a glob pattern so that Redis SCAN's
+// case-sensitive MATCH performs a case-insensitive comparison instead. Team
+// names are granted access via an AppProject naming convention of
+// "<team>-XXX-YYY", and team membership is compared to the AppProject prefix
+// case-insensitively, so each ASCII letter is expanded into a "[aA]"-style
+// character class. Existing "[...]" character classes and "\"-escaped
+// characters are passed through unchanged, since folding letters inside them
+// would change their meaning.
+func caseInsensitiveGlob(pattern string) string {
+	var b strings.Builder
+	inBracket := false
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch {
+		case c == '\\' && i+1 < len(pattern):
+			b.WriteByte(c)
+			b.WriteByte(pattern[i+1])
+			i++
+		case c == '[':
+			inBracket = true
+			b.WriteByte(c)
+		case c == ']':
+			inBracket = false
+			b.WriteByte(c)
+		case !inBracket && c >= 'a' && c <= 'z':
+			b.WriteByte('[')
+			b.WriteByte(c)
+			b.WriteByte(c - 'a' + 'A')
+			b.WriteByte(']')
+		case !inBracket && c >= 'A' && c <= 'Z':
+			b.WriteByte('[')
+			b.WriteByte(c)
+			b.WriteByte(c - 'A' + 'a')
+			b.WriteByte(']')
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 // scanKeys returns all Redis keys matching the given glob pattern using SCAN,
 // which iterates the keyspace in bounded batches instead of blocking the server
 // like KEYS does.
@@ -459,11 +500,12 @@ func scanKeys(redisClient *redis.Client, match string) ([]string, error) {
 // fetchRawApplications returns the raw JSON bytes of every application whose key
 // matches one of the object patterns. Values are returned exactly as the watcher
 // stored them in Redis; they are not deserialized, so callers can stream them
-// straight into the response without re-marshaling.
+// straight into the response without re-marshaling. Matching is case-insensitive,
+// since team-to-AppProject access is granted by a case-insensitive prefix match.
 func fetchRawApplications(redisClient *redis.Client, objectPatterns map[string]struct{}) [][]byte {
 	var allKeys []string
 	for pattern := range objectPatterns {
-		keys, err := scanKeys(redisClient, fmt.Sprintf("%s|*", pattern))
+		keys, err := scanKeys(redisClient, fmt.Sprintf("%s|*", caseInsensitiveGlob(pattern)))
 		if err != nil {
 			log.Printf("Failed to scan keys for pattern %s: %v", pattern, err)
 			continue
@@ -538,12 +580,14 @@ func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [
 // matchesObjectPattern reports whether object (typically "<project>/<name>")
 // matches an ArgoCD-style glob pattern. "*" is treated as matching everything,
 // including objects containing "/", which path.Match would otherwise reject
-// since "/" is a segment separator for it.
+// since "/" is a segment separator for it. The comparison is case-insensitive,
+// matching the case-insensitive team-to-AppProject prefix grant used on the
+// allow path.
 func matchesObjectPattern(pattern, object string) bool {
 	if pattern == "*" {
 		return true
 	}
-	matched, err := path.Match(pattern, object)
+	matched, err := path.Match(strings.ToLower(pattern), strings.ToLower(object))
 	return err == nil && matched
 }
 
