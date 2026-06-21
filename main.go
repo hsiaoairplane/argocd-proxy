@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +38,26 @@ import (
 const argoCDSecretKeyField = "server.secretkey"
 
 const listApplicationsPath = "/api/v1/applications"
+
+// rbacPolicy holds the object glob patterns a subject (user or group) is
+// granted, split by ArgoCD policy effect. A deny match always overrides an
+// allow match for the same object, so the two are kept separate rather than
+// merged into a single pattern list.
+type rbacPolicy struct {
+	allow []string
+	deny  []string
+}
+
+// allowedResources are the ArgoCD RBAC resource types that gate visibility of
+// items in the cached application list. Rules for other resource types (e.g.
+// "clusters", "certificates") don't affect which applications are returned by
+// this proxy, so they are ignored by parsePolicyCSV.
+var allowedResources = map[string]bool{
+	"applications":    true,
+	"applicationsets": true,
+	"logs":            true,
+	"exec":            true,
+}
 
 // Define Prometheus metrics for HTTP request duration (milliseconds) and total request count.
 var requestDuration = prometheus.NewHistogramVec(
@@ -170,7 +191,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string][]string, map[string][]string) {
+func loadRBACPolicyFromConfigMap(clientset *kubernetes.Clientset, namespace, configMapName string) (map[string]rbacPolicy, map[string]rbacPolicy) {
 	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		log.Errorf("Failed to fetch ConfigMap %s: %v", configMapName, err)
@@ -251,7 +272,7 @@ func shouldInterceptListRequest(r *http.Request) bool {
 	return r.Method == http.MethodGet && r.URL.Path == listApplicationsPath
 }
 
-func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, signingKey []byte, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) {
+func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy, redisClient *redis.Client, signingKey []byte, userToObjectPatternMapping, groupToObjectPatternMapping map[string]rbacPolicy) {
 	token := extractToken(r)
 	if token == "" || !shouldInterceptListRequest(r) {
 		proxy.ServeHTTP(w, r)
@@ -267,12 +288,16 @@ func handleRequest(w http.ResponseWriter, r *http.Request, proxy *httputil.Rever
 
 	email, _ := payload["email"].(string)
 	groups := extractGroups(payload)
-	objectPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
+	allowPatterns, denyPatterns := resolveObjectPatterns(email, groups, userToObjectPatternMapping, groupToObjectPatternMapping)
 
-	items := fetchRawApplications(redisClient, objectPatterns)
+	items := fetchRawApplications(redisClient, allowPatterns)
 	if len(items) == 0 {
 		proxy.ServeHTTP(w, r)
 		return
+	}
+
+	if len(denyPatterns) > 0 {
+		items = excludeDenied(items, denyPatterns)
 	}
 
 	queryParams := r.URL.Query()
@@ -389,20 +414,30 @@ func verifyAndDecodeJWT(token string, signingKey []byte) (map[string]interface{}
 	return claims, nil
 }
 
-func resolveObjectPatterns(email string, groups []string, userToObjectPatternMapping, groupToObjectPatternMapping map[string][]string) map[string]struct{} {
-	objectPatterns := make(map[string]struct{})
+// resolveObjectPatterns unions the allow and deny object patterns granted to a
+// user directly and through their groups. ArgoCD's policy effect rule is
+// "some(where (p.eft == allow)) && !some(where (p.eft == deny))", i.e. a deny
+// match always overrides any allow match for the same object, regardless of
+// which subject (user or group) it came from; the deny patterns returned here
+// are applied as a post-fetch filter by the caller to honor that rule even
+// when a deny pattern doesn't textually overlap an allow pattern.
+func resolveObjectPatterns(email string, groups []string, userToObjectPatternMapping, groupToObjectPatternMapping map[string]rbacPolicy) (map[string]struct{}, []string) {
+	allow := make(map[string]struct{})
+	var deny []string
 
-	for _, pattern := range userToObjectPatternMapping[email] {
-		objectPatterns[pattern] = struct{}{}
-	}
-
-	for _, group := range groups {
-		for _, pattern := range groupToObjectPatternMapping[group] {
-			objectPatterns[pattern] = struct{}{}
+	addPolicy := func(policy rbacPolicy) {
+		for _, pattern := range policy.allow {
+			allow[pattern] = struct{}{}
 		}
+		deny = append(deny, policy.deny...)
 	}
 
-	return objectPatterns
+	addPolicy(userToObjectPatternMapping[email])
+	for _, group := range groups {
+		addPolicy(groupToObjectPatternMapping[group])
+	}
+
+	return allow, deny
 }
 
 // scanKeys returns all Redis keys matching the given glob pattern using SCAN,
@@ -504,10 +539,56 @@ func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [
 	return filtered
 }
 
-// parseCSVLine tokenizes a single ArgoCD RBAC policy.csv line into its
-// comma-separated fields, honoring quoted values so commas inside a quoted
-// field (e.g. an LDAP group DN like "cn=foo,ou=bar,dc=example,dc=com") are
-// not treated as field separators.
+// matchesObjectPattern reports whether object (typically "<project>/<name>")
+// matches an ArgoCD-style glob pattern. "*" is treated as matching everything,
+// including objects containing "/", which path.Match would otherwise reject
+// since "/" is a segment separator for it.
+func matchesObjectPattern(pattern, object string) bool {
+	if pattern == "*" {
+		return true
+	}
+	matched, err := path.Match(pattern, object)
+	return err == nil && matched
+}
+
+// excludeDenied removes applications matching any deny pattern from items.
+// Each item is unmarshaled just enough to read its project and name, mirroring
+// the approach filterRawByClusterAndNamespace uses for the destination fields.
+func excludeDenied(items [][]byte, denyPatterns []string) [][]byte {
+	filtered := make([][]byte, 0, len(items))
+	for _, raw := range items {
+		var app struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Project string `json:"project"`
+			} `json:"spec"`
+		}
+		if err := json.Unmarshal(raw, &app); err != nil {
+			continue
+		}
+		object := app.Spec.Project + "/" + app.Metadata.Name
+
+		denied := false
+		for _, pattern := range denyPatterns {
+			if matchesObjectPattern(pattern, object) {
+				denied = true
+				break
+			}
+		}
+		if denied {
+			continue
+		}
+
+		filtered = append(filtered, raw)
+	}
+	return filtered
+}
+
+// parseCSVLine parses a single RBAC policy line into trimmed fields, using
+// encoding/csv so quoted fields may safely contain commas (e.g. an LDAP group
+// DN like "CN=Team Alpha,OU=Groups,DC=example,DC=com").
 func parseCSVLine(line string) ([]string, error) {
 	reader := csv.NewReader(strings.NewReader(line))
 	reader.TrimLeadingSpace = true
@@ -521,100 +602,128 @@ func parseCSVLine(line string) ([]string, error) {
 	return fields, nil
 }
 
-func parsePolicyCSV(policyCSV string) (map[string][]string, map[string][]string) {
-	userToRoleMapping := make(map[string][]string)
-	groupToRoleMapping := make(map[string][]string)
+// resolveReachableRoles returns every role transitively reachable from
+// subject by following "g" (subject-to-role) edges, supporting ArgoCD's
+// role-to-role inheritance (e.g. "g, role:org-admin, role:admin"). Cycles are
+// guarded against via the visited set so a misconfigured policy can't cause
+// infinite recursion.
+func resolveReachableRoles(subject string, edges map[string][]string) []string {
+	visited := make(map[string]bool)
+	var roles []string
 
-	roleToObjectPatternMapping := make(map[string][]string)
+	var visit func(string)
+	visit = func(s string) {
+		for _, role := range edges[s] {
+			if visited[role] {
+				continue
+			}
+			visited[role] = true
+			roles = append(roles, role)
+			visit(role)
+		}
+	}
+	visit(subject)
+
+	return roles
+}
+
+// parsePolicyCSV parses an ArgoCD RBAC policy.csv document into per-subject
+// allow/deny object pattern policies, one map for users (subjects containing
+// "@") and one for groups. "g" lines are also used to build a generic
+// subject-to-role graph so role-to-role inheritance (e.g.
+// "g, role:org-admin, role:admin") is resolved transitively, not just one
+// level deep. Only "p" rules for resource types that affect application
+// visibility (allowedResources) contribute object patterns; rules for other
+// resource types (e.g. "clusters") are ignored.
+func parsePolicyCSV(policyCSV string) (map[string]rbacPolicy, map[string]rbacPolicy) {
+	// subjectEdges records every "g, subject, role" edge. It doubles as the
+	// graph resolveReachableRoles walks for role-to-role inheritance, since a
+	// role can itself be the subject of another "g" line.
+	subjectEdges := make(map[string][]string)
+
+	seenUser := make(map[string]bool)
+	seenGroup := make(map[string]bool)
+	var userSubjects, groupSubjects []string
+
+	roleToPolicyMapping := make(map[string]rbacPolicy)
 	// default rules
 	// - role:admin: unrestricted access to all objects
 	// - role:readonly: read-only access to all objects
-	roleToObjectPatternMapping["role:admin"] = []string{"*"}
-	roleToObjectPatternMapping["role:readonly"] = []string{"*"}
+	roleToPolicyMapping["role:admin"] = rbacPolicy{allow: []string{"*"}}
+	roleToPolicyMapping["role:readonly"] = rbacPolicy{allow: []string{"*"}}
 
-	lines := strings.Split(policyCSV, "\n")
-	for _, line := range lines {
-		// Ignore empty lines and comments
-		line = strings.TrimSpace(line)
+	scanner := bufio.NewScanner(strings.NewReader(policyCSV))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Split the line into fields, respecting quoted values so that
-		// fields containing literal commas (e.g. LDAP group DNs) parse
-		// as a single field instead of being split apart.
 		fields, err := parseCSVLine(line)
 		if err != nil {
-			log.Warnf("Skipping malformed RBAC policy line %q: %v", line, err)
+			log.Errorf("Failed to parse RBAC policy line %q: %v", line, err)
 			continue
 		}
 
-		// Process "g" entries (group-role mappings)
-		if fields[0] == "g" && len(fields) >= 3 {
+		switch {
+		case fields[0] == "g" && len(fields) >= 3:
 			userOrGroup := fields[1]
 			role := fields[2]
+			subjectEdges[userOrGroup] = append(subjectEdges[userOrGroup], role)
 
 			if strings.Contains(userOrGroup, "@") {
-				// Process user-role mappings
-				user := userOrGroup
-				if _, exists := userToRoleMapping[user]; !exists {
-					// Initialize the role in the groupToRoleMapping map if it doesn't exist
-					userToRoleMapping[user] = []string{}
+				if !seenUser[userOrGroup] {
+					seenUser[userOrGroup] = true
+					userSubjects = append(userSubjects, userOrGroup)
 				}
-				userToRoleMapping[user] = append(userToRoleMapping[user], role)
-			} else {
-				// Process group-role mappings
-				group := userOrGroup
-				if _, exists := groupToRoleMapping[group]; !exists {
-					// Initialize the role in the groupToRoleMapping map if it doesn't exist
-					groupToRoleMapping[group] = []string{}
-				}
-				groupToRoleMapping[group] = append(groupToRoleMapping[group], role)
+			} else if !seenGroup[userOrGroup] {
+				seenGroup[userOrGroup] = true
+				groupSubjects = append(groupSubjects, userOrGroup)
 			}
-		}
 
-		// Process "p" entries (role-resource mappings)
-		if fields[0] == "p" && len(fields) >= 5 {
+		case fields[0] == "p" && len(fields) >= 5:
 			role := fields[1]
 			resource := fields[2]
 			// action := fields[3]
 			objectPattern := fields[4]
-			// effect := field[5]
-
-			if resource == "applications" || resource == "applicationsets" || resource == "logs" || resource == "exec" {
-				objectPattern = strings.TrimSuffix(objectPattern, "/*")
+			effect := "allow"
+			if len(fields) >= 6 && fields[5] != "" {
+				effect = strings.ToLower(fields[5])
 			}
 
-			if _, exists := roleToObjectPatternMapping[role]; !exists {
-				// Initialize the role in the roleToObjectPatternMapping map if it doesn't exist
-				roleToObjectPatternMapping[role] = []string{}
+			if !allowedResources[resource] {
+				continue
 			}
-			roleToObjectPatternMapping[role] = append(roleToObjectPatternMapping[role], objectPattern)
+
+			policy := roleToPolicyMapping[role]
+			if effect == "deny" {
+				// Deny patterns are matched per-application against the raw
+				// "<project>/<name>" object, so they keep their original
+				// "/*" suffix rather than being trimmed for SCAN prefixing.
+				policy.deny = append(policy.deny, objectPattern)
+			} else {
+				policy.allow = append(policy.allow, strings.TrimSuffix(objectPattern, "/*"))
+			}
+			roleToPolicyMapping[role] = policy
 		}
 	}
 
-	// Aggregate the user to object pattern mapping
-	userToObjectPatternMapping := make(map[string][]string)
-	for user, roles := range userToRoleMapping {
-		userToObjectPatternMapping[user] = []string{}
-
-		for _, role := range roles {
-			if objectPatterns, exists := roleToObjectPatternMapping[role]; exists {
-				userToObjectPatternMapping[user] = append(userToObjectPatternMapping[user], objectPatterns...)
+	aggregate := func(subjects []string) map[string]rbacPolicy {
+		result := make(map[string]rbacPolicy, len(subjects))
+		for _, subject := range subjects {
+			var policy rbacPolicy
+			for _, role := range resolveReachableRoles(subject, subjectEdges) {
+				rolePolicy, exists := roleToPolicyMapping[role]
+				if !exists {
+					continue
+				}
+				policy.allow = append(policy.allow, rolePolicy.allow...)
+				policy.deny = append(policy.deny, rolePolicy.deny...)
 			}
+			result[subject] = policy
 		}
+		return result
 	}
 
-	// Aggregate the group to object pattern mapping
-	groupToObjectPatternMapping := make(map[string][]string)
-	for group, roles := range groupToRoleMapping {
-		groupToObjectPatternMapping[group] = []string{}
-
-		for _, role := range roles {
-			if objectPatterns, exists := roleToObjectPatternMapping[role]; exists {
-				groupToObjectPatternMapping[group] = append(groupToObjectPatternMapping[group], objectPatterns...)
-			}
-		}
-	}
-	return userToObjectPatternMapping, groupToObjectPatternMapping
+	return aggregate(userSubjects), aggregate(groupSubjects)
 }

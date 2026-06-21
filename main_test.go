@@ -19,8 +19,8 @@ func TestParsePolicyCSV(t *testing.T) {
 	tests := []struct {
 		name                                string
 		policyCSV                           string
-		expectedUserToObjectPatternMapping  map[string][]string
-		expectedGroupToObjectPatternMapping map[string][]string
+		expectedUserToObjectPatternMapping  map[string]rbacPolicy
+		expectedGroupToObjectPatternMapping map[string]rbacPolicy
 	}{
 		{
 			name: "Valid policy CSV with single team ALPHA READ ONLY",
@@ -35,32 +35,23 @@ func TestParsePolicyCSV(t *testing.T) {
 				g, ALPHA READ ONLY_TW, team-alpha-readonly
 				g, foobar@gmail.com, team-alpha-readonly
 			`,
-			expectedUserToObjectPatternMapping: map[string][]string{
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{
 				"admin@gmail.com": {
-					"*",
+					allow: []string{"*"},
 				},
 				"admin@hotmail.com": {
-					"*",
+					allow: []string{"*"},
 				},
 				"foobar@gmail.com": {
-					"alpha1-*",
-					"alpha2-*",
-					"alpha3-*",
-					"alpha4-*",
+					allow: []string{"alpha1-*", "alpha2-*", "alpha3-*", "alpha4-*"},
 				},
 			},
-			expectedGroupToObjectPatternMapping: map[string][]string{
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{
 				"ALPHA READ ONLY": {
-					"alpha1-*",
-					"alpha2-*",
-					"alpha3-*",
-					"alpha4-*",
+					allow: []string{"alpha1-*", "alpha2-*", "alpha3-*", "alpha4-*"},
 				},
 				"ALPHA READ ONLY_TW": {
-					"alpha1-*",
-					"alpha2-*",
-					"alpha3-*",
-					"alpha4-*",
+					allow: []string{"alpha1-*", "alpha2-*", "alpha3-*", "alpha4-*"},
 				},
 			},
 		},
@@ -79,33 +70,29 @@ func TestParsePolicyCSV(t *testing.T) {
 				g, BETA READ ONLY_TW, team-beta-readonly
 				g, barfoo@gmail.com, team-beta-readonly
 			`,
-			expectedUserToObjectPatternMapping: map[string][]string{
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{
 				"admin@gmail.com": {
-					"*",
+					allow: []string{"*"},
 				},
 				"admin@hotmail.com": {
-					"*",
+					allow: []string{"*"},
 				},
 				"barfoo@gmail.com": {
-					"beta-*",
+					allow: []string{"beta-*"},
 				},
 			},
-			expectedGroupToObjectPatternMapping: map[string][]string{
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{
 				"ALPHA READ ONLY": {
-					"alpha1-*",
-					"alpha2-*",
-					"alpha3-*",
+					allow: []string{"alpha1-*", "alpha2-*", "alpha3-*"},
 				},
 				"ALPHA READ ONLY_TW": {
-					"alpha1-*",
-					"alpha2-*",
-					"alpha3-*",
+					allow: []string{"alpha1-*", "alpha2-*", "alpha3-*"},
 				},
 				"BETA READ ONLY": {
-					"beta-*",
+					allow: []string{"beta-*"},
 				},
 				"BETA READ ONLY_TW": {
-					"beta-*",
+					allow: []string{"beta-*"},
 				},
 			},
 		},
@@ -114,8 +101,8 @@ func TestParsePolicyCSV(t *testing.T) {
 			policyCSV: `
 				g, GAMMA READ ONLY, team-gamma-readonly
 			`,
-			expectedUserToObjectPatternMapping: map[string][]string{},
-			expectedGroupToObjectPatternMapping: map[string][]string{
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{},
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{
 				"GAMMA READ ONLY": {},
 			},
 		},
@@ -124,21 +111,65 @@ func TestParsePolicyCSV(t *testing.T) {
 			policyCSV: `
 				p, team-gamma-readonly, applications, get, gamma-*, allow
 			`,
-			expectedUserToObjectPatternMapping:  map[string][]string{},
-			expectedGroupToObjectPatternMapping: map[string][]string{},
+			expectedUserToObjectPatternMapping:  map[string]rbacPolicy{},
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{},
 		},
 		{
-			name: "Group name with quoted embedded comma is parsed as a single field",
+			name: "Deny effect overrides a broader allow pattern",
 			policyCSV: `
-				p, team-delta-readonly, applications, get, delta-*, allow
-				g, "cn=delta-readonly,ou=groups,dc=example,dc=com", team-delta-readonly
+				p, team-alpha, applications, get, alpha-*, allow
+				p, team-alpha, applications, get, alpha-secret/*, deny
+				g, alpha@gmail.com, team-alpha
 			`,
-			expectedUserToObjectPatternMapping: map[string][]string{},
-			expectedGroupToObjectPatternMapping: map[string][]string{
-				"cn=delta-readonly,ou=groups,dc=example,dc=com": {
-					"delta-*",
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{
+				"alpha@gmail.com": {
+					allow: []string{"alpha-*"},
+					deny:  []string{"alpha-secret/*"},
 				},
 			},
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{},
+		},
+		{
+			name: "Quoted CSV field containing a comma",
+			policyCSV: `
+				p, team-ldap, applications, get, ldap-*, allow
+				g, "CN=Team Alpha,OU=Groups,DC=example,DC=com", team-ldap
+			`,
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{},
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{
+				"CN=Team Alpha,OU=Groups,DC=example,DC=com": {
+					allow: []string{"ldap-*"},
+				},
+			},
+		},
+		{
+			name: "Role-to-role inheritance",
+			policyCSV: `
+				p, role:admin-base, applications, get, base-*, allow
+				g, role:org-admin, role:admin-base
+				g, admin@gmail.com, role:org-admin
+			`,
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{
+				"admin@gmail.com": {
+					allow: []string{"base-*"},
+				},
+			},
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{
+				"role:org-admin": {
+					allow: []string{"base-*"},
+				},
+			},
+		},
+		{
+			name: "Resource types unrelated to applications are ignored",
+			policyCSV: `
+				p, team-alpha, clusters, get, https://example.com, allow
+				g, alpha@gmail.com, team-alpha
+			`,
+			expectedUserToObjectPatternMapping: map[string]rbacPolicy{
+				"alpha@gmail.com": {},
+			},
+			expectedGroupToObjectPatternMapping: map[string]rbacPolicy{},
 		},
 	}
 
@@ -146,10 +177,10 @@ func TestParsePolicyCSV(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			userToObjectPatternMapping, groupToObjectPatternMapping := parsePolicyCSV(tt.policyCSV)
 			if !reflect.DeepEqual(userToObjectPatternMapping, tt.expectedUserToObjectPatternMapping) {
-				t.Errorf("Expected user %v, but got user %v", tt.expectedUserToObjectPatternMapping, userToObjectPatternMapping)
+				t.Errorf("Expected user %+v, but got user %+v", tt.expectedUserToObjectPatternMapping, userToObjectPatternMapping)
 			}
 			if !reflect.DeepEqual(groupToObjectPatternMapping, tt.expectedGroupToObjectPatternMapping) {
-				t.Errorf("Expected group %v, but got group %v", tt.expectedGroupToObjectPatternMapping, groupToObjectPatternMapping)
+				t.Errorf("Expected group %+v, but got group %+v", tt.expectedGroupToObjectPatternMapping, groupToObjectPatternMapping)
 			}
 		})
 	}
@@ -160,19 +191,20 @@ func TestResolveObjectPatterns(t *testing.T) {
 		name                        string
 		email                       string
 		groups                      []string
-		userToObjectPatternMapping  map[string][]string
-		groupToObjectPatternMapping map[string][]string
-		expectedPatterns            map[string]struct{}
+		userToObjectPatternMapping  map[string]rbacPolicy
+		groupToObjectPatternMapping map[string]rbacPolicy
+		expectedAllow               map[string]struct{}
+		expectedDeny                []string
 	}{
 		{
 			name:   "User with direct patterns",
 			email:  "user1@example.com",
 			groups: []string{},
-			userToObjectPatternMapping: map[string][]string{
-				"user1@example.com": {"pattern1", "pattern2"},
+			userToObjectPatternMapping: map[string]rbacPolicy{
+				"user1@example.com": {allow: []string{"pattern1", "pattern2"}},
 			},
-			groupToObjectPatternMapping: map[string][]string{},
-			expectedPatterns: map[string]struct{}{
+			groupToObjectPatternMapping: map[string]rbacPolicy{},
+			expectedAllow: map[string]struct{}{
 				"pattern1": {},
 				"pattern2": {},
 			},
@@ -181,13 +213,13 @@ func TestResolveObjectPatterns(t *testing.T) {
 			name:   "Group with patterns",
 			email:  "user2@example.com",
 			groups: []string{"group1"},
-			userToObjectPatternMapping: map[string][]string{
+			userToObjectPatternMapping: map[string]rbacPolicy{
 				"user2@example.com": {},
 			},
-			groupToObjectPatternMapping: map[string][]string{
-				"group1": {"pattern3", "pattern4"},
+			groupToObjectPatternMapping: map[string]rbacPolicy{
+				"group1": {allow: []string{"pattern3", "pattern4"}},
 			},
-			expectedPatterns: map[string]struct{}{
+			expectedAllow: map[string]struct{}{
 				"pattern3": {},
 				"pattern4": {},
 			},
@@ -196,14 +228,14 @@ func TestResolveObjectPatterns(t *testing.T) {
 			name:   "User and groups with patterns",
 			email:  "user3@example.com",
 			groups: []string{"group1", "group2"},
-			userToObjectPatternMapping: map[string][]string{
-				"user3@example.com": {"pattern5"},
+			userToObjectPatternMapping: map[string]rbacPolicy{
+				"user3@example.com": {allow: []string{"pattern5"}},
 			},
-			groupToObjectPatternMapping: map[string][]string{
-				"group1": {"pattern6"},
-				"group2": {"pattern7"},
+			groupToObjectPatternMapping: map[string]rbacPolicy{
+				"group1": {allow: []string{"pattern6"}},
+				"group2": {allow: []string{"pattern7"}},
 			},
-			expectedPatterns: map[string]struct{}{
+			expectedAllow: map[string]struct{}{
 				"pattern5": {},
 				"pattern6": {},
 				"pattern7": {},
@@ -213,18 +245,37 @@ func TestResolveObjectPatterns(t *testing.T) {
 			name:                        "No patterns for user or groups",
 			email:                       "user4@example.com",
 			groups:                      []string{"group3"},
-			userToObjectPatternMapping:  map[string][]string{},
-			groupToObjectPatternMapping: map[string][]string{},
-			expectedPatterns:            map[string]struct{}{},
+			userToObjectPatternMapping:  map[string]rbacPolicy{},
+			groupToObjectPatternMapping: map[string]rbacPolicy{},
+			expectedAllow:               map[string]struct{}{},
+		},
+		{
+			name:   "Deny patterns are collected from both user and group policies",
+			email:  "user5@example.com",
+			groups: []string{"group1"},
+			userToObjectPatternMapping: map[string]rbacPolicy{
+				"user5@example.com": {allow: []string{"pattern1"}, deny: []string{"pattern1-secret/*"}},
+			},
+			groupToObjectPatternMapping: map[string]rbacPolicy{
+				"group1": {allow: []string{"pattern2"}, deny: []string{"pattern2-secret/*"}},
+			},
+			expectedAllow: map[string]struct{}{
+				"pattern1": {},
+				"pattern2": {},
+			},
+			expectedDeny: []string{"pattern1-secret/*", "pattern2-secret/*"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := resolveObjectPatterns(tt.email, tt.groups, tt.userToObjectPatternMapping, tt.groupToObjectPatternMapping)
+			allow, deny := resolveObjectPatterns(tt.email, tt.groups, tt.userToObjectPatternMapping, tt.groupToObjectPatternMapping)
 
-			if !reflect.DeepEqual(result, tt.expectedPatterns) {
-				t.Errorf("resolveObjectPatterns() = %v, want %v", result, tt.expectedPatterns)
+			if !reflect.DeepEqual(allow, tt.expectedAllow) {
+				t.Errorf("resolveObjectPatterns() allow = %v, want %v", allow, tt.expectedAllow)
+			}
+			if !reflect.DeepEqual(deny, tt.expectedDeny) {
+				t.Errorf("resolveObjectPatterns() deny = %v, want %v", deny, tt.expectedDeny)
 			}
 		})
 	}
@@ -464,6 +515,98 @@ func TestFilterRawByClusterAndNamespace(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMatchesObjectPattern(t *testing.T) {
+	tests := []struct {
+		name     string
+		pattern  string
+		object   string
+		expected bool
+	}{
+		{name: "Bare wildcard matches any object", pattern: "*", object: "myproj/myapp", expected: true},
+		{name: "Project wildcard matches app in project", pattern: "myproj/*", object: "myproj/myapp", expected: true},
+		{name: "Project wildcard does not match other project", pattern: "myproj/*", object: "otherproj/myapp", expected: false},
+		{name: "Exact match", pattern: "myproj/myapp", object: "myproj/myapp", expected: true},
+		{name: "Prefix glob within project", pattern: "myproj/alpha-*", object: "myproj/alpha-1", expected: true},
+		{name: "Prefix glob does not match other prefix", pattern: "myproj/alpha-*", object: "myproj/beta-1", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if result := matchesObjectPattern(tt.pattern, tt.object); result != tt.expected {
+				t.Errorf("matchesObjectPattern(%q, %q) = %v, want %v", tt.pattern, tt.object, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestExcludeDenied(t *testing.T) {
+	makeApp := func(project, name string) []byte {
+		b, _ := json.Marshal(map[string]interface{}{
+			"metadata": map[string]interface{}{"name": name},
+			"spec":     map[string]interface{}{"project": project},
+		})
+		return b
+	}
+
+	appA := makeApp("myproj", "alpha-1")
+	appB := makeApp("myproj", "alpha-secret")
+	appC := makeApp("myproj", "beta-1")
+
+	tests := []struct {
+		name         string
+		items        [][]byte
+		denyPatterns []string
+		expected     [][]byte
+	}{
+		{
+			name:         "Narrow deny within a broad allow",
+			items:        [][]byte{appA, appB, appC},
+			denyPatterns: []string{"myproj/alpha-secret"},
+			expected:     [][]byte{appA, appC},
+		},
+		{
+			name:         "Deny all via bare wildcard",
+			items:        [][]byte{appA, appB, appC},
+			denyPatterns: []string{"*"},
+			expected:     [][]byte{},
+		},
+		{
+			name:         "No deny patterns",
+			items:        [][]byte{appA, appB},
+			denyPatterns: nil,
+			expected:     [][]byte{appA, appB},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := excludeDenied(tt.items, tt.denyPatterns)
+			if len(result) != len(tt.expected) {
+				t.Errorf("excludeDenied() returned %d items, want %d", len(result), len(tt.expected))
+				return
+			}
+			for i, item := range result {
+				if !bytes.Equal(item, tt.expected[i]) {
+					t.Errorf("excludeDenied()[%d] = %s, want %s", i, item, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestResolveReachableRoles(t *testing.T) {
+	edges := map[string][]string{
+		"admin@gmail.com": {"role:org-admin"},
+		"role:org-admin":  {"role:admin-base", "role:org-admin"}, // self-edge to verify cycle safety
+	}
+
+	result := resolveReachableRoles("admin@gmail.com", edges)
+	expected := []string{"role:org-admin", "role:admin-base"}
+	if !reflect.DeepEqual(result, expected) {
+		t.Errorf("resolveReachableRoles() = %v, want %v", result, expected)
 	}
 }
 
