@@ -127,6 +127,19 @@ func TestParsePolicyCSV(t *testing.T) {
 			expectedUserToObjectPatternMapping:  map[string][]string{},
 			expectedGroupToObjectPatternMapping: map[string][]string{},
 		},
+		{
+			name: "Group name with quoted embedded comma is parsed as a single field",
+			policyCSV: `
+				p, team-delta-readonly, applications, get, delta-*, allow
+				g, "cn=delta-readonly,ou=groups,dc=example,dc=com", team-delta-readonly
+			`,
+			expectedUserToObjectPatternMapping: map[string][]string{},
+			expectedGroupToObjectPatternMapping: map[string][]string{
+				"cn=delta-readonly,ou=groups,dc=example,dc=com": {
+					"delta-*",
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
