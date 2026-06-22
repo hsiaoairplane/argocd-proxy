@@ -77,3 +77,5 @@ An **ArgoCD Proxy** enhances the performance of the ArgoCD list application API 
   - `--argocd-secret`: Name of the ArgoCD Secret holding the session-signing key, `server.secretkey` (default `argocd-secret`).
 
 - **Session token verification**: Requests to the cached `/api/v1/applications` list endpoint carry an ArgoCD session JWT, which the proxy verifies (HS256) against `server.secretkey` from the ArgoCD Secret before trusting any of its claims. The proxy's ServiceAccount needs `get` on that Secret in addition to the RBAC ConfigMap; if the key can't be loaded, the cached fast path is disabled and every request falls back to the real ArgoCD backend, which still enforces its own RBAC.
+
+- **RBAC policy semantics**: `policy.csv` is parsed with the same effect rule ArgoCD uses — a `deny` rule for an object always overrides any `allow` rule for that object, regardless of which role or group granted the allow. Role-to-role inheritance (`g, role:child, role:parent`) is resolved transitively, and fields are parsed with quote-aware CSV parsing so values containing commas (e.g. LDAP group DNs) are handled correctly.
