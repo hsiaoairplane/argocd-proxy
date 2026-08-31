@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/go-redis/redis/v7 v7.4.1
-	github.com/gobwas/glob v0.2.3
+	github.com/gobwas/glob v1.0.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/sirupsen/logrus v1.10.2
