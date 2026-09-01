@@ -539,7 +539,7 @@ func filterRawByClusterAndNamespace(items [][]byte, cluster, namespace string) [
 // globCache memoizes compiled glob patterns; the same deny pattern is reused
 // across many requests (and many items within a request), so compiling once
 // per distinct pattern avoids recompiling on every call.
-var globCache sync.Map // map[string]glob.Glob
+var globCache sync.Map // map[string]*glob.Pattern
 
 // compileObjectGlob compiles pattern with no path separators configured, so
 // "*" matches across "/" just like ArgoCD's own RBAC enforcer (which uses
@@ -547,9 +547,9 @@ var globCache sync.Map // map[string]glob.Glob
 // against "<project>/<name>" objects, and a pattern without an explicit "/"
 // (e.g. "team-*" instead of "team-*/*") must still be able to match through
 // the "/" to agree with ArgoCD's policy semantics.
-func compileObjectGlob(pattern string) (glob.Glob, error) {
+func compileObjectGlob(pattern string) (*glob.Pattern, error) {
 	if g, ok := globCache.Load(pattern); ok {
-		return g.(glob.Glob), nil
+		return g.(*glob.Pattern), nil
 	}
 	g, err := glob.Compile(pattern)
 	if err != nil {
