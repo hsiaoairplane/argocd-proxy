@@ -325,6 +325,50 @@ func TestExtractToken(t *testing.T) {
 			},
 			expectedToken: "",
 		},
+		{
+			name: "Chunked token reassembled from multiple cookies",
+			setupRequest: func() *http.Request {
+				// ArgoCD splits a large token: the base cookie holds
+				// "<chunkCount>:<chunk0>" and the rest go in argocd.token-1, -2...
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.AddCookie(&http.Cookie{Name: "argocd.token", Value: "3:aaa"})
+				req.AddCookie(&http.Cookie{Name: "argocd.token-1", Value: "bbb"})
+				req.AddCookie(&http.Cookie{Name: "argocd.token-2", Value: "ccc"})
+				return req
+			},
+			expectedToken: "aaabbbccc",
+		},
+		{
+			name: "Chunked token reassembled regardless of cookie order",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.AddCookie(&http.Cookie{Name: "argocd.token-2", Value: "ccc"})
+				req.AddCookie(&http.Cookie{Name: "argocd.token", Value: "3:aaa"})
+				req.AddCookie(&http.Cookie{Name: "argocd.token-1", Value: "bbb"})
+				return req
+			},
+			expectedToken: "aaabbbccc",
+		},
+		{
+			name: "Authorization header wins over chunked cookies",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.Header.Set("Authorization", "Bearer header_token")
+				req.AddCookie(&http.Cookie{Name: "argocd.token", Value: "2:aaa"})
+				req.AddCookie(&http.Cookie{Name: "argocd.token-1", Value: "bbb"})
+				return req
+			},
+			expectedToken: "header_token",
+		},
+		{
+			name: "Malformed chunk count yields empty token",
+			setupRequest: func() *http.Request {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.AddCookie(&http.Cookie{Name: "argocd.token", Value: "notanumber:aaa"})
+				return req
+			},
+			expectedToken: "",
+		},
 	}
 
 	for _, tt := range tests {
