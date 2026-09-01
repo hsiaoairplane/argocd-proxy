@@ -1,4 +1,4 @@
-module github.com/jenting/argocd-proxy
+module github.com/hsiaoairplane/argocd-proxy
 
 go 1.26.0
 
