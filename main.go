@@ -378,14 +378,58 @@ func extractGroups(payload map[string]interface{}) []string {
 	return groups
 }
 
+// tokenCookieName is the base cookie ArgoCD stores the session token in.
+const tokenCookieName = "argocd.token"
+
 func extractToken(r *http.Request) string {
 	if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		return strings.TrimPrefix(authHeader, "Bearer ")
 	}
-	if cookie, err := r.Cookie("argocd.token"); err == nil {
-		return cookie.Value
+	return joinChunkedToken(r.Cookies())
+}
+
+// joinChunkedToken reconstructs a session token that ArgoCD may have split
+// across multiple cookies. When a token's value exceeds the ~4093-byte
+// per-cookie limit (common for SSO users carrying many group claims), ArgoCD's
+// server stores it as "<chunkCount>:<chunk0>" in the base "argocd.token" cookie
+// and the remaining chunks in "argocd.token-1", "argocd.token-2", ... A token
+// that fits in one cookie has no "<count>:" prefix. This mirrors ArgoCD's own
+// util/http.JoinCookies so the proxy verifies exactly the token the backend
+// would; a malformed or absent cookie yields "" so the caller falls back to
+// proxying the request unchanged. Returns "" when no token cookie is present.
+func joinChunkedToken(cookies []*http.Cookie) string {
+	chunks := make(map[string]string)
+	for _, c := range cookies {
+		if strings.HasPrefix(c.Name, tokenCookieName) {
+			chunks[c.Name] = c.Value
+		}
 	}
-	return ""
+
+	base, ok := chunks[tokenCookieName]
+	if !ok {
+		return ""
+	}
+
+	var sb strings.Builder
+	numChunks := 1
+	// A JWT never contains a colon, so a base value with one is the
+	// "<count>:<chunk0>" form ArgoCD writes for a split token.
+	switch parts := strings.SplitN(base, ":", 2); len(parts) {
+	case 1:
+		sb.WriteString(parts[0])
+	case 2:
+		n, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return ""
+		}
+		numChunks = n
+		sb.WriteString(parts[1])
+	}
+
+	for i := 1; i < numChunks; i++ {
+		sb.WriteString(chunks[fmt.Sprintf("%s-%d", tokenCookieName, i)])
+	}
+	return sb.String()
 }
 
 // verifyAndDecodeJWT verifies the token's HMAC signature against signingKey
